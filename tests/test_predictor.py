@@ -12,7 +12,9 @@ from src.predictor import (
     discover_context_files,
     discover_context_files_with_metadata,
     format_scan_metadata,
+    gather_git_context,
     load_scoring_config_file,
+    resolve_project_path,
     resolve_context,
     resolve_context_with_metadata,
     write_snapshot_file,
@@ -28,6 +30,13 @@ class PredictorTests(unittest.TestCase):
         report = self.p.predict(context)
         self.assertIn("stabilize correctness", report.current_intent_inference.lower())
         self.assertEqual(len(report.likely_next_actions), 6)
+        self.assertGreaterEqual(len(report.future_improvements), 3)
+
+    def test_future_improvements_include_release_automation_when_git_context_present(self):
+        context = "[git-log:last-8-commits]\nabc123 2026-02-10 feat: add parser\nbcd234 2026-02-11 fix: db timeout"
+        report = self.p.predict(context)
+        titles = [item.title.lower() for item in report.future_improvements]
+        self.assertTrue(any("changelog/release-note generation" in t for t in titles))
 
     def test_framework_deviation_detection(self):
         context = "We should add another framework and boilerplate-heavy stack."
@@ -303,6 +312,20 @@ class PredictorTests(unittest.TestCase):
             loaded = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(loaded["tag"], "test")
             self.assertEqual(loaded["prediction"]["current_intent_inference"], "x")
+
+    def test_resolve_project_path_relative_and_absolute(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rel = resolve_project_path(tmp, "nested/file.log")
+            self.assertTrue(rel.endswith("nested/file.log"))
+
+            absolute_path = str((Path(tmp) / "abs.txt").resolve())
+            absolute = resolve_project_path(tmp, absolute_path)
+            self.assertEqual(absolute, absolute_path)
+
+    def test_gather_git_context_for_non_repo_returns_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = gather_git_context(max_commits=3, repo_dir=tmp)
+            self.assertEqual(out, "")
 
 
 if __name__ == "__main__":

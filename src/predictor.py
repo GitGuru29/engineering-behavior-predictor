@@ -112,6 +112,7 @@ class PredictionReport:
     likely_next_actions: List[RankedItem]
     current_intent_inference: str
     decision_predictions: List[str]
+    future_improvements: List[RankedItem]
     style_deviations_detected: List[str]
     reasoning_trace: List[str]
     alternative_paths: List[RankedItem]
@@ -130,6 +131,12 @@ class PredictionReport:
         lines.append("\n## Decision Predictions")
         for idx, decision in enumerate(self.decision_predictions, start=1):
             lines.append(f"{idx}. {decision}")
+
+        lines.append("\n## Future Improvements (ranked)")
+        for idx, item in enumerate(self.future_improvements, start=1):
+            lines.append(
+                f"{idx}. {item.title} - {int(item.probability * 100)}% likely value. {item.rationale}"
+            )
 
         lines.append("\n## Style Deviations Detected")
         if self.style_deviations_detected:
@@ -213,6 +220,7 @@ def build_prediction_payload(report: PredictionReport, include_scan: bool, scan:
         "likely_next_actions": [item.__dict__ for item in report.likely_next_actions],
         "current_intent_inference": report.current_intent_inference,
         "decision_predictions": report.decision_predictions,
+        "future_improvements": [item.__dict__ for item in report.future_improvements],
         "style_deviations_detected": report.style_deviations_detected,
         "reasoning_trace": report.reasoning_trace,
         "alternative_paths": [item.__dict__ for item in report.alternative_paths],
@@ -256,6 +264,14 @@ def write_snapshot_file(path: str, snapshot: dict) -> str:
     return str(file_path)
 
 
+def resolve_project_path(project_dir: str, raw_path: str) -> str:
+    base = Path(project_dir).expanduser().resolve()
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    return str(candidate.resolve())
+
+
 class DigitalTwinPredictor:
     """Deterministic, evidence-based predictor for technical work patterns."""
 
@@ -295,6 +311,10 @@ class DigitalTwinPredictor:
         has_long_horizon = signal_hits.get("long_horizon", False)
         has_logs = signal_hits.get("logs", False)
         has_db = signal_hits.get("db", False)
+        has_git_history = "[git-log:last-" in lctx
+        has_recent_delivery_markers = bool(
+            re.search(r"\bfeat|fix|refactor|perf|test|docs|chore\b", lctx)
+        )
 
         if has_benchmark:
             decisions.append("Prefer measuring before rewriting; profile first, then optimize the top hotspot only.")
@@ -347,11 +367,22 @@ class DigitalTwinPredictor:
             ]
 
         alternatives = self._alternatives(has_benchmark, has_bug, has_blocked, has_arch)
+        future_improvements = self._future_improvements(
+            has_benchmark=has_benchmark,
+            has_bug=has_bug,
+            has_arch=has_arch,
+            has_blocked=has_blocked,
+            has_db=has_db,
+            has_long_horizon=has_long_horizon,
+            has_git_history=has_git_history,
+            has_recent_delivery_markers=has_recent_delivery_markers,
+        )
 
         return PredictionReport(
             likely_next_actions=ranked,
             current_intent_inference=intent,
             decision_predictions=decisions,
+            future_improvements=future_improvements,
             style_deviations_detected=deviations,
             reasoning_trace=reasoning,
             alternative_paths=alternatives,
@@ -434,6 +465,95 @@ class DigitalTwinPredictor:
             ),
         ]
         return sorted(options, key=lambda x: x.probability, reverse=True)[:3]
+
+    @staticmethod
+    def _future_improvements(
+        has_benchmark: bool,
+        has_bug: bool,
+        has_arch: bool,
+        has_blocked: bool,
+        has_db: bool,
+        has_long_horizon: bool,
+        has_git_history: bool,
+        has_recent_delivery_markers: bool,
+    ) -> List[RankedItem]:
+        improvements = [
+            RankedItem(
+                title="Expand regression and benchmark coverage for recently touched hotspots",
+                probability=round(
+                    min(
+                        0.95,
+                        0.52 + (0.20 if has_bug else 0.0) + (0.16 if has_benchmark else 0.0),
+                    ),
+                    2,
+                ),
+                rationale="Recent reliability/performance signals indicate the highest ROI comes from repeatable validation around changed paths.",
+            ),
+            RankedItem(
+                title="Introduce CI guardrails (tests, lint, and performance budgets) for change gating",
+                probability=round(
+                    min(
+                        0.95,
+                        0.50 + (0.14 if (has_bug or has_benchmark) else 0.0),
+                    ),
+                    2,
+                ),
+                rationale="Automated gates reduce regression risk and preserve behavior as iteration speed increases.",
+            ),
+            RankedItem(
+                title="Create or update ADRs and module boundaries before the next major refactor",
+                probability=round(
+                    min(
+                        0.95,
+                        0.46 + (0.18 if has_arch else 0.0) + (0.12 if has_long_horizon else 0.0),
+                    ),
+                    2,
+                ),
+                rationale="Architecture discipline compounds over long-running projects and lowers integration risk.",
+            ),
+            RankedItem(
+                title="Automate changelog/release-note generation from commit history",
+                probability=round(
+                    min(
+                        0.95,
+                        0.38
+                        + (0.16 if has_git_history else 0.0)
+                        + (0.10 if has_recent_delivery_markers else 0.0),
+                    ),
+                    2,
+                ),
+                rationale="If delivery history is active, automated summarization improves traceability and planning continuity.",
+            ),
+            RankedItem(
+                title="Harden storage observability with query plan checks and index review cadence",
+                probability=round(
+                    min(0.95, 0.40 + (0.24 if has_db else 0.0)),
+                    2,
+                ),
+                rationale="Database-linked work benefits from explicit telemetry and index hygiene to prevent hidden bottlenecks.",
+            ),
+            RankedItem(
+                title="Maintain a blocker-handling queue for parallelizable tasks",
+                probability=round(
+                    min(0.95, 0.36 + (0.24 if has_blocked else 0.0)),
+                    2,
+                ),
+                rationale="When blockers recur, a prepared fallback queue protects delivery velocity without context loss.",
+            ),
+            RankedItem(
+                title="Derive a technical-debt roadmap from repeated fix/refactor patterns",
+                probability=round(
+                    min(
+                        0.95,
+                        0.42 + (0.16 if has_git_history else 0.0) + (0.08 if has_bug else 0.0),
+                    ),
+                    2,
+                ),
+                rationale="Historical change patterns expose structural debt clusters that are best addressed intentionally.",
+            ),
+        ]
+
+        return sorted(improvements, key=lambda x: x.probability, reverse=True)[:5]
 
 
 def _skip(path: str, reason: str) -> dict:
@@ -616,16 +736,21 @@ def discover_context_files(
     return files
 
 
-def gather_git_context(max_commits: int = 8) -> str:
+def gather_git_context(max_commits: int = 8, repo_dir: str | None = None) -> str:
+    cmd = ["git"]
+    if repo_dir:
+        cmd.extend(["-C", repo_dir])
+    cmd.extend(
+        [
+            "log",
+            f"--max-count={max_commits}",
+            "--pretty=format:%h %ad %s",
+            "--date=short",
+        ]
+    )
     try:
         result = subprocess.run(
-            [
-                "git",
-                "log",
-                f"--max-count={max_commits}",
-                "--pretty=format:%h %ad %s",
-                "--date=short",
-            ],
+            cmd,
             check=False,
             capture_output=True,
             text=True,
@@ -655,6 +780,7 @@ def resolve_context_with_metadata(
     dir_ignore_dirs: List[str] | None = None,
     from_git: bool = False,
     git_commits: int = 8,
+    git_repo_dir: str | None = None,
 ) -> tuple[str, dict]:
     parts = []
     scan = {
@@ -708,7 +834,7 @@ def resolve_context_with_metadata(
             parts.append(file_ctx)
 
     if from_git:
-        git_ctx = gather_git_context(max_commits=git_commits)
+        git_ctx = gather_git_context(max_commits=git_commits, repo_dir=git_repo_dir)
         if git_ctx:
             scan["from_git"]["included"] = True
             parts.append(git_ctx)
@@ -734,6 +860,7 @@ def resolve_context(
     dir_ignore_dirs: List[str] | None = None,
     from_git: bool = False,
     git_commits: int = 8,
+    git_repo_dir: str | None = None,
 ) -> str:
     context, _ = resolve_context_with_metadata(
         inline_context=inline_context,
@@ -747,6 +874,7 @@ def resolve_context(
         dir_ignore_dirs=dir_ignore_dirs,
         from_git=from_git,
         git_commits=git_commits,
+        git_repo_dir=git_repo_dir,
     )
     return context
 
@@ -820,6 +948,12 @@ def main() -> None:
         type=str,
         default="",
         help="Current project context text. If omitted, reads from stdin.",
+    )
+    parser.add_argument(
+        "--project-dir",
+        type=str,
+        default=".",
+        help="Target project directory used for relative paths and --from-git.",
     )
     parser.add_argument(
         "--json",
@@ -910,10 +1044,23 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    project_dir = Path(args.project_dir).expanduser().resolve()
+    if not project_dir.exists() or not project_dir.is_dir():
+        raise SystemExit(f"Invalid --project-dir: {project_dir} is not a directory")
+
+    resolved_from_files = [
+        resolve_project_path(str(project_dir), raw) for raw in args.from_files
+    ]
+    resolved_from_dir = (
+        resolve_project_path(str(project_dir), args.from_dir.strip())
+        if args.from_dir.strip()
+        else None
+    )
+
     context, scan = resolve_context_with_metadata(
         inline_context=args.context,
-        from_files=args.from_files,
-        from_dir=args.from_dir.strip() or None,
+        from_files=resolved_from_files,
+        from_dir=resolved_from_dir,
         dir_patterns=args.dir_patterns,
         dir_max_files=max(args.dir_max_files, 1),
         dir_recursive=not args.non_recursive,
@@ -922,6 +1069,7 @@ def main() -> None:
         dir_ignore_dirs=args.ignore_dirs,
         from_git=args.from_git,
         git_commits=max(args.git_commits, 1),
+        git_repo_dir=str(project_dir),
     )
     if not context:
         context = input("Paste context: ").strip()
@@ -929,7 +1077,9 @@ def main() -> None:
     scoring_config = None
     if args.weights_file.strip():
         try:
-            scoring_config = load_scoring_config_file(args.weights_file.strip())
+            scoring_config = load_scoring_config_file(
+                resolve_project_path(str(project_dir), args.weights_file.strip())
+            )
         except ValueError as exc:
             raise SystemExit(f"Invalid --weights-file: {exc}") from exc
 
@@ -959,7 +1109,10 @@ def main() -> None:
             show_scan=args.show_scan,
         )
         try:
-            output_path = write_snapshot_file(args.snapshot_out.strip(), snapshot)
+            output_path = write_snapshot_file(
+                resolve_project_path(str(project_dir), args.snapshot_out.strip()),
+                snapshot,
+            )
         except ValueError as exc:
             raise SystemExit(f"Invalid --snapshot-out: {exc}") from exc
         print(f"snapshot written: {output_path}", file=sys.stderr)

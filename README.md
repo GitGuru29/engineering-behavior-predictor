@@ -7,6 +7,7 @@ Dependency-free CLI that predicts likely next technical actions from project con
 This provides a concrete starting point for your behavioral-digital-twin idea:
 - Ranked likely actions with probability estimates
 - Intent inference for what you're likely trying to build/fix/optimize
+- Ranked future improvements inferred from current project trajectory
 - Style deviation detection against your baseline tendencies
 - Alternative path ranking with explicit triggers
 
@@ -46,6 +47,19 @@ Use project artifacts as context:
 ```bash
 python3 src/predictor.py --from-files notes.txt debug.log issue.md
 ```
+
+Run against another project directory (without `cd`):
+
+```bash
+python3 src/predictor.py \
+  --project-dir /path/to/other-project \
+  --from-dir . \
+  --from-git \
+  --show-scan
+```
+
+This mode uses that project's files + commit history to produce both
+near-term predictions and ranked future improvements.
 
 Auto-discover recent context files from a directory:
 
