@@ -1,0 +1,39 @@
+{
+  "action_base_scores": {
+    "Write or update a concise architecture/design note before large edits": 0.58,
+    "Run focused profiling/benchmarking on current bottlenecks": 0.54,
+    "Implement the smallest viable change that unlocks blocked flow": 0.5,
+    "Add targeted regression/performance tests around changed behavior": 0.48,
+    "Refactor hot-path code to reduce abstraction overhead": 0.46,
+    "Temporarily switch to a parallel subtask while preserving context": 0.42
+  },
+  "signal_patterns": {
+    "benchmark": "benchmark|latency|throughput|perf",
+    "bug": "bug|regression|failure|error|panic|exception",
+    "arch": "architecture|design|diagram|adr",
+    "blocked": "blocked|stuck|waiting|dependency",
+    "framework": "framework|boilerplate|scaffold|library",
+    "long_horizon": "roadmap|research|long-term|phd|prototype",
+    "logs": "log|trace|stack",
+    "db": "db|database|query|index|storage"
+  },
+  "signal_boosts": {
+    "benchmark": {
+      "Run focused profiling/benchmarking on current bottlenecks": 0.22,
+      "Refactor hot-path code to reduce abstraction overhead": 0.1
+    },
+    "bug": {
+      "Add targeted regression/performance tests around changed behavior": 0.2,
+      "Implement the smallest viable change that unlocks blocked flow": 0.08
+    },
+    "arch": {
+      "Write or update a concise architecture/design note before large edits": 0.24
+    },
+    "blocked": {
+      "Temporarily switch to a parallel subtask while preserving context": 0.24
+    },
+    "long_horizon": {
+      "Write or update a concise architecture/design note before large edits": 0.06
+    }
+  }
+}

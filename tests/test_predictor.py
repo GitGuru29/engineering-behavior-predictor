@@ -8,6 +8,7 @@ from src.predictor import (
     discover_context_files,
     discover_context_files_with_metadata,
     format_scan_metadata,
+    load_scoring_config_file,
     resolve_context,
     resolve_context_with_metadata,
 )
@@ -213,6 +214,30 @@ class PredictorTests(unittest.TestCase):
         self.assertIn("high=1, medium=1, low=0", formatted)
         self.assertIn("severity=high", formatted)
         self.assertLess(formatted.index("c.log"), formatted.index("b.log"))
+
+    def test_custom_scoring_config_changes_ranking(self):
+        custom = {
+            "action_base_scores": {
+                "Temporarily switch to a parallel subtask while preserving context": 2.0
+            }
+        }
+        predictor = DigitalTwinPredictor(scoring_config=custom)
+        report = predictor.predict("generic context with no strong signals")
+        self.assertEqual(
+            report.likely_next_actions[0].title,
+            "Temporarily switch to a parallel subtask while preserving context",
+        )
+
+    def test_load_scoring_config_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "weights.json"
+            path.write_text(
+                '{\"signal_patterns\": {\"benchmark\": \"fps|frametime\"}}',
+                encoding="utf-8",
+            )
+            loaded = load_scoring_config_file(str(path))
+            self.assertIn("action_base_scores", loaded)
+            self.assertEqual(loaded["signal_patterns"]["benchmark"], "fps|frametime")
 
 
 if __name__ == "__main__":

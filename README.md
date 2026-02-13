@@ -28,6 +28,19 @@ JSON mode:
 python3 src/predictor.py --context "..." --json
 ```
 
+Use a custom scoring config:
+
+```bash
+python3 src/predictor.py --context "fps dropped after refactor" --weights-file config/weights.example.json
+```
+
+Start from template:
+
+```bash
+cp config/weights.example.json config/weights.local.json
+python3 src/predictor.py --from-dir . --weights-file config/weights.local.json
+```
+
 Use project artifacts as context:
 
 ```bash
@@ -86,5 +99,5 @@ python3 -m unittest -v tests/test_predictor.py
 ## Next engineering increments
 
 1. Add context adapters (git commits, issue text, benchmark logs).
-2. Add weighted configuration file for pattern tuning.
+2. Add remediation hints for scan skips.
 3. Add regression corpus and calibration checks for probability stability.

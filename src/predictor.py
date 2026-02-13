@@ -45,6 +45,43 @@ SKIP_REASON_SEVERITY = {
     "duplicate_candidate": "low",
     "not_a_file": "low",
 }
+DEFAULT_ACTION_SCORES = {
+    "Write or update a concise architecture/design note before large edits": 0.58,
+    "Run focused profiling/benchmarking on current bottlenecks": 0.54,
+    "Implement the smallest viable change that unlocks blocked flow": 0.50,
+    "Add targeted regression/performance tests around changed behavior": 0.48,
+    "Refactor hot-path code to reduce abstraction overhead": 0.46,
+    "Temporarily switch to a parallel subtask while preserving context": 0.42,
+}
+DEFAULT_SIGNAL_PATTERNS = {
+    "benchmark": r"benchmark|latency|throughput|perf",
+    "bug": r"bug|regression|failure|error|panic|exception",
+    "arch": r"architecture|design|diagram|adr",
+    "blocked": r"blocked|stuck|waiting|dependency",
+    "framework": r"framework|boilerplate|scaffold|library",
+    "long_horizon": r"roadmap|research|long-term|phd|prototype",
+    "logs": r"log|trace|stack",
+    "db": r"db|database|query|index|storage",
+}
+DEFAULT_SIGNAL_BOOSTS = {
+    "benchmark": {
+        "Run focused profiling/benchmarking on current bottlenecks": 0.22,
+        "Refactor hot-path code to reduce abstraction overhead": 0.10,
+    },
+    "bug": {
+        "Add targeted regression/performance tests around changed behavior": 0.20,
+        "Implement the smallest viable change that unlocks blocked flow": 0.08,
+    },
+    "arch": {
+        "Write or update a concise architecture/design note before large edits": 0.24,
+    },
+    "blocked": {
+        "Temporarily switch to a parallel subtask while preserving context": 0.24,
+    },
+    "long_horizon": {
+        "Write or update a concise architecture/design note before large edits": 0.06,
+    },
+}
 
 
 @dataclass
@@ -98,58 +135,116 @@ class PredictionReport:
         return "\n".join(lines)
 
 
+def build_scoring_config(custom: dict | None = None) -> dict:
+    config = {
+        "action_base_scores": dict(DEFAULT_ACTION_SCORES),
+        "signal_patterns": dict(DEFAULT_SIGNAL_PATTERNS),
+        "signal_boosts": {
+            signal: dict(boosts) for signal, boosts in DEFAULT_SIGNAL_BOOSTS.items()
+        },
+    }
+    if not custom:
+        return config
+
+    raw_actions = custom.get("action_base_scores", {})
+    if isinstance(raw_actions, dict):
+        for action, score in raw_actions.items():
+            try:
+                config["action_base_scores"][str(action)] = float(score)
+            except (TypeError, ValueError):
+                continue
+
+    raw_patterns = custom.get("signal_patterns", {})
+    if isinstance(raw_patterns, dict):
+        for signal, pattern in raw_patterns.items():
+            if isinstance(pattern, str):
+                config["signal_patterns"][str(signal)] = pattern
+
+    raw_boosts = custom.get("signal_boosts", {})
+    if isinstance(raw_boosts, dict):
+        for signal, boost_map in raw_boosts.items():
+            if not isinstance(boost_map, dict):
+                continue
+            signal_key = str(signal)
+            current = dict(config["signal_boosts"].get(signal_key, {}))
+            for action, delta in boost_map.items():
+                try:
+                    current[str(action)] = float(delta)
+                except (TypeError, ValueError):
+                    continue
+            config["signal_boosts"][signal_key] = current
+
+    return config
+
+
+def load_scoring_config_file(path: str) -> dict:
+    file_path = Path(path)
+    if not file_path.exists() or not file_path.is_file():
+        raise ValueError(f"file not found: {path}")
+    try:
+        payload = json.loads(file_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"read failed: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid json: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("top-level json value must be an object")
+    return build_scoring_config(payload)
+
+
 class DigitalTwinPredictor:
     """Deterministic, evidence-based predictor for technical work patterns."""
 
-    def __init__(self, baseline: dict | None = None):
+    def __init__(self, baseline: dict | None = None, scoring_config: dict | None = None):
         self.baseline = baseline or BASELINE_PATTERNS
+        self.scoring_config = build_scoring_config(scoring_config)
 
     def predict(self, context: str) -> PredictionReport:
         ctx = context.strip()
         lctx = ctx.lower()
 
-        action_scores = {
-            "Write or update a concise architecture/design note before large edits": 0.58,
-            "Run focused profiling/benchmarking on current bottlenecks": 0.54,
-            "Implement the smallest viable change that unlocks blocked flow": 0.50,
-            "Add targeted regression/performance tests around changed behavior": 0.48,
-            "Refactor hot-path code to reduce abstraction overhead": 0.46,
-            "Temporarily switch to a parallel subtask while preserving context": 0.42,
-        }
+        action_scores = dict(self.scoring_config["action_base_scores"])
 
         reasoning = []
         deviations = []
         decisions = []
 
         # Signal extraction from context text
-        has_benchmark = bool(re.search(r"benchmark|latency|throughput|perf", lctx))
-        has_bug = bool(re.search(r"bug|regression|failure|error|panic|exception", lctx))
-        has_arch = bool(re.search(r"architecture|design|diagram|adr", lctx))
-        has_blocked = bool(re.search(r"blocked|stuck|waiting|dependency", lctx))
-        has_framework = bool(re.search(r"framework|boilerplate|scaffold|library", lctx))
-        has_long_horizon = bool(re.search(r"roadmap|research|long-term|phd|prototype", lctx))
-        has_logs = bool(re.search(r"log|trace|stack", lctx))
-        has_db = bool(re.search(r"db|database|query|index|storage", lctx))
+        signal_hits = {}
+        for signal, pattern in self.scoring_config["signal_patterns"].items():
+            if not pattern:
+                signal_hits[signal] = False
+                continue
+            signal_hits[signal] = bool(re.search(pattern, lctx))
+
+        for signal, hit in signal_hits.items():
+            if not hit:
+                continue
+            for action, delta in self.scoring_config["signal_boosts"].get(signal, {}).items():
+                action_scores[action] = action_scores.get(action, 0.0) + float(delta)
+
+        has_benchmark = signal_hits.get("benchmark", False)
+        has_bug = signal_hits.get("bug", False)
+        has_arch = signal_hits.get("arch", False)
+        has_blocked = signal_hits.get("blocked", False)
+        has_framework = signal_hits.get("framework", False)
+        has_long_horizon = signal_hits.get("long_horizon", False)
+        has_logs = signal_hits.get("logs", False)
+        has_db = signal_hits.get("db", False)
 
         if has_benchmark:
-            action_scores["Run focused profiling/benchmarking on current bottlenecks"] += 0.22
-            action_scores["Refactor hot-path code to reduce abstraction overhead"] += 0.10
             decisions.append("Prefer measuring before rewriting; profile first, then optimize the top hotspot only.")
             reasoning.append("Performance terms in context indicate optimization-first sequencing.")
 
         if has_bug:
-            action_scores["Add targeted regression/performance tests around changed behavior"] += 0.20
-            action_scores["Implement the smallest viable change that unlocks blocked flow"] += 0.08
             decisions.append("Constrain blast radius with minimal, test-backed fixes before broader refactors.")
             reasoning.append("Failure signals imply immediate containment and reproducibility work.")
 
         if has_arch:
-            action_scores["Write or update a concise architecture/design note before large edits"] += 0.24
             decisions.append("Keep architecture artifacts current to preserve long-term correctness under iteration.")
             reasoning.append("Architecture references align with design-first behavior.")
 
         if has_blocked:
-            action_scores["Temporarily switch to a parallel subtask while preserving context"] += 0.24
             decisions.append("Pivot to an unblocked subsystem while capturing exact blocker state for fast return.")
             reasoning.append("Blocker language maps to strategic task switching rather than idle context switching.")
 
@@ -160,7 +255,6 @@ class DigitalTwinPredictor:
             reasoning.append("Potential mismatch detected: framework reliance vs minimal-framework preference.")
 
         if has_long_horizon:
-            action_scores["Write or update a concise architecture/design note before large edits"] += 0.06
             decisions.append("Bias toward modular boundaries and explicit interfaces for long-horizon maintainability.")
             reasoning.append("Long-horizon signals increase emphasis on architecture and interface stability.")
 
@@ -695,6 +789,12 @@ def main() -> None:
         action="store_true",
         help="Show metadata for ingested and skipped files.",
     )
+    parser.add_argument(
+        "--weights-file",
+        type=str,
+        default="",
+        help="JSON scoring config overrides (action scores, signal patterns, boosts).",
+    )
 
     args = parser.parse_args()
 
@@ -714,7 +814,14 @@ def main() -> None:
     if not context:
         context = input("Paste context: ").strip()
 
-    predictor = DigitalTwinPredictor()
+    scoring_config = None
+    if args.weights_file.strip():
+        try:
+            scoring_config = load_scoring_config_file(args.weights_file.strip())
+        except ValueError as exc:
+            raise SystemExit(f"Invalid --weights-file: {exc}") from exc
+
+    predictor = DigitalTwinPredictor(scoring_config=scoring_config)
     report = predictor.predict(context)
 
     if args.json:
