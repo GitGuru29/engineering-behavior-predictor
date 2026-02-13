@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import argparse
+from datetime import datetime, timezone
 import fnmatch
+import hashlib
 import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 from typing import List
 
 
@@ -44,6 +47,56 @@ SKIP_REASON_SEVERITY = {
     "ignored_pattern": "low",
     "duplicate_candidate": "low",
     "not_a_file": "low",
+}
+SKIP_REASON_HINTS = {
+    "read_error": "Verify file permissions and file encoding before rerunning.",
+    "stat_error": "Check filesystem access and retry with accessible paths.",
+    "missing_or_not_directory": "Fix --from-dir path or create the target directory.",
+    "missing_or_not_file": "Fix file path typos or regenerate missing artifact files.",
+    "over_max_bytes": "Increase --dir-max-bytes or narrow file patterns.",
+    "over_max_files": "Increase --dir-max-files or tighten --dir-patterns.",
+    "empty_file": "Regenerate logs/notes so files contain meaningful context.",
+    "ignored_dir": "Remove directory from --ignore-dirs if it must be scanned.",
+    "ignored_pattern": "Adjust --ignore-patterns to include this file.",
+    "duplicate_candidate": "Remove duplicate file inputs from --from-files.",
+    "not_a_file": "Provide only regular files, not directories or device paths.",
+}
+DEFAULT_ACTION_SCORES = {
+    "Write or update a concise architecture/design note before large edits": 0.58,
+    "Run focused profiling/benchmarking on current bottlenecks": 0.54,
+    "Implement the smallest viable change that unlocks blocked flow": 0.50,
+    "Add targeted regression/performance tests around changed behavior": 0.48,
+    "Refactor hot-path code to reduce abstraction overhead": 0.46,
+    "Temporarily switch to a parallel subtask while preserving context": 0.42,
+}
+DEFAULT_SIGNAL_PATTERNS = {
+    "benchmark": r"benchmark|latency|throughput|perf",
+    "bug": r"bug|regression|failure|error|panic|exception",
+    "arch": r"architecture|design|diagram|adr",
+    "blocked": r"blocked|stuck|waiting|dependency",
+    "framework": r"framework|boilerplate|scaffold|library",
+    "long_horizon": r"roadmap|research|long-term|phd|prototype",
+    "logs": r"log|trace|stack",
+    "db": r"db|database|query|index|storage",
+}
+DEFAULT_SIGNAL_BOOSTS = {
+    "benchmark": {
+        "Run focused profiling/benchmarking on current bottlenecks": 0.22,
+        "Refactor hot-path code to reduce abstraction overhead": 0.10,
+    },
+    "bug": {
+        "Add targeted regression/performance tests around changed behavior": 0.20,
+        "Implement the smallest viable change that unlocks blocked flow": 0.08,
+    },
+    "arch": {
+        "Write or update a concise architecture/design note before large edits": 0.24,
+    },
+    "blocked": {
+        "Temporarily switch to a parallel subtask while preserving context": 0.24,
+    },
+    "long_horizon": {
+        "Write or update a concise architecture/design note before large edits": 0.06,
+    },
 }
 
 
@@ -98,58 +151,164 @@ class PredictionReport:
         return "\n".join(lines)
 
 
+def build_scoring_config(custom: dict | None = None) -> dict:
+    config = {
+        "action_base_scores": dict(DEFAULT_ACTION_SCORES),
+        "signal_patterns": dict(DEFAULT_SIGNAL_PATTERNS),
+        "signal_boosts": {
+            signal: dict(boosts) for signal, boosts in DEFAULT_SIGNAL_BOOSTS.items()
+        },
+    }
+    if not custom:
+        return config
+
+    raw_actions = custom.get("action_base_scores", {})
+    if isinstance(raw_actions, dict):
+        for action, score in raw_actions.items():
+            try:
+                config["action_base_scores"][str(action)] = float(score)
+            except (TypeError, ValueError):
+                continue
+
+    raw_patterns = custom.get("signal_patterns", {})
+    if isinstance(raw_patterns, dict):
+        for signal, pattern in raw_patterns.items():
+            if isinstance(pattern, str):
+                config["signal_patterns"][str(signal)] = pattern
+
+    raw_boosts = custom.get("signal_boosts", {})
+    if isinstance(raw_boosts, dict):
+        for signal, boost_map in raw_boosts.items():
+            if not isinstance(boost_map, dict):
+                continue
+            signal_key = str(signal)
+            current = dict(config["signal_boosts"].get(signal_key, {}))
+            for action, delta in boost_map.items():
+                try:
+                    current[str(action)] = float(delta)
+                except (TypeError, ValueError):
+                    continue
+            config["signal_boosts"][signal_key] = current
+
+    return config
+
+
+def load_scoring_config_file(path: str) -> dict:
+    file_path = Path(path)
+    if not file_path.exists() or not file_path.is_file():
+        raise ValueError(f"file not found: {path}")
+    try:
+        payload = json.loads(file_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"read failed: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid json: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("top-level json value must be an object")
+    return build_scoring_config(payload)
+
+
+def build_prediction_payload(report: PredictionReport, include_scan: bool, scan: dict) -> dict:
+    payload = {
+        "likely_next_actions": [item.__dict__ for item in report.likely_next_actions],
+        "current_intent_inference": report.current_intent_inference,
+        "decision_predictions": report.decision_predictions,
+        "style_deviations_detected": report.style_deviations_detected,
+        "reasoning_trace": report.reasoning_trace,
+        "alternative_paths": [item.__dict__ for item in report.alternative_paths],
+    }
+    if include_scan:
+        payload["scan"] = scan
+    return payload
+
+
+def build_snapshot_document(
+    prediction_payload: dict,
+    context: str,
+    snapshot_tag: str = "",
+    weights_file: str = "",
+    show_scan: bool = False,
+) -> dict:
+    context_hash = hashlib.sha256(context.encode("utf-8")).hexdigest()
+    return {
+        "schema_version": 1,
+        "generated_at_utc": (
+            datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        ),
+        "tag": snapshot_tag.strip(),
+        "context_sha256": context_hash,
+        "context_length_chars": len(context),
+        "run_config": {
+            "weights_file": weights_file.strip(),
+            "show_scan": bool(show_scan),
+        },
+        "prediction": prediction_payload,
+    }
+
+
+def write_snapshot_file(path: str, snapshot: dict) -> str:
+    file_path = Path(path)
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"failed to write snapshot: {exc}") from exc
+    return str(file_path)
+
+
 class DigitalTwinPredictor:
     """Deterministic, evidence-based predictor for technical work patterns."""
 
-    def __init__(self, baseline: dict | None = None):
+    def __init__(self, baseline: dict | None = None, scoring_config: dict | None = None):
         self.baseline = baseline or BASELINE_PATTERNS
+        self.scoring_config = build_scoring_config(scoring_config)
 
     def predict(self, context: str) -> PredictionReport:
         ctx = context.strip()
         lctx = ctx.lower()
 
-        action_scores = {
-            "Write or update a concise architecture/design note before large edits": 0.58,
-            "Run focused profiling/benchmarking on current bottlenecks": 0.54,
-            "Implement the smallest viable change that unlocks blocked flow": 0.50,
-            "Add targeted regression/performance tests around changed behavior": 0.48,
-            "Refactor hot-path code to reduce abstraction overhead": 0.46,
-            "Temporarily switch to a parallel subtask while preserving context": 0.42,
-        }
+        action_scores = dict(self.scoring_config["action_base_scores"])
 
         reasoning = []
         deviations = []
         decisions = []
 
         # Signal extraction from context text
-        has_benchmark = bool(re.search(r"benchmark|latency|throughput|perf", lctx))
-        has_bug = bool(re.search(r"bug|regression|failure|error|panic|exception", lctx))
-        has_arch = bool(re.search(r"architecture|design|diagram|adr", lctx))
-        has_blocked = bool(re.search(r"blocked|stuck|waiting|dependency", lctx))
-        has_framework = bool(re.search(r"framework|boilerplate|scaffold|library", lctx))
-        has_long_horizon = bool(re.search(r"roadmap|research|long-term|phd|prototype", lctx))
-        has_logs = bool(re.search(r"log|trace|stack", lctx))
-        has_db = bool(re.search(r"db|database|query|index|storage", lctx))
+        signal_hits = {}
+        for signal, pattern in self.scoring_config["signal_patterns"].items():
+            if not pattern:
+                signal_hits[signal] = False
+                continue
+            signal_hits[signal] = bool(re.search(pattern, lctx))
+
+        for signal, hit in signal_hits.items():
+            if not hit:
+                continue
+            for action, delta in self.scoring_config["signal_boosts"].get(signal, {}).items():
+                action_scores[action] = action_scores.get(action, 0.0) + float(delta)
+
+        has_benchmark = signal_hits.get("benchmark", False)
+        has_bug = signal_hits.get("bug", False)
+        has_arch = signal_hits.get("arch", False)
+        has_blocked = signal_hits.get("blocked", False)
+        has_framework = signal_hits.get("framework", False)
+        has_long_horizon = signal_hits.get("long_horizon", False)
+        has_logs = signal_hits.get("logs", False)
+        has_db = signal_hits.get("db", False)
 
         if has_benchmark:
-            action_scores["Run focused profiling/benchmarking on current bottlenecks"] += 0.22
-            action_scores["Refactor hot-path code to reduce abstraction overhead"] += 0.10
             decisions.append("Prefer measuring before rewriting; profile first, then optimize the top hotspot only.")
             reasoning.append("Performance terms in context indicate optimization-first sequencing.")
 
         if has_bug:
-            action_scores["Add targeted regression/performance tests around changed behavior"] += 0.20
-            action_scores["Implement the smallest viable change that unlocks blocked flow"] += 0.08
             decisions.append("Constrain blast radius with minimal, test-backed fixes before broader refactors.")
             reasoning.append("Failure signals imply immediate containment and reproducibility work.")
 
         if has_arch:
-            action_scores["Write or update a concise architecture/design note before large edits"] += 0.24
             decisions.append("Keep architecture artifacts current to preserve long-term correctness under iteration.")
             reasoning.append("Architecture references align with design-first behavior.")
 
         if has_blocked:
-            action_scores["Temporarily switch to a parallel subtask while preserving context"] += 0.24
             decisions.append("Pivot to an unblocked subsystem while capturing exact blocker state for fast return.")
             reasoning.append("Blocker language maps to strategic task switching rather than idle context switching.")
 
@@ -160,7 +319,6 @@ class DigitalTwinPredictor:
             reasoning.append("Potential mismatch detected: framework reliance vs minimal-framework preference.")
 
         if has_long_horizon:
-            action_scores["Write or update a concise architecture/design note before large edits"] += 0.06
             decisions.append("Bias toward modular boundaries and explicit interfaces for long-horizon maintainability.")
             reasoning.append("Long-horizon signals increase emphasis on architecture and interface stability.")
 
@@ -280,11 +438,13 @@ class DigitalTwinPredictor:
 
 def _skip(path: str, reason: str) -> dict:
     severity = SKIP_REASON_SEVERITY.get(reason, "low")
+    hint = SKIP_REASON_HINTS.get(reason, "Review scan filters and file accessibility.")
     return {
         "path": path,
         "reason": reason,
         "severity": severity,
         "severity_score": SEVERITY_RANK[severity],
+        "hint": hint,
     }
 
 
@@ -312,6 +472,30 @@ def sort_skips_by_severity(skipped_files: List[dict]) -> List[dict]:
             ),
             item.get("reason", ""),
             item.get("path", ""),
+        ),
+    )
+
+
+def summarize_remediation_hints(skipped_files: List[dict]) -> List[dict]:
+    grouped = {}
+    for item in skipped_files:
+        reason = item.get("reason", "unknown")
+        if reason in grouped:
+            grouped[reason]["count"] += 1
+            continue
+        severity = item.get("severity", SKIP_REASON_SEVERITY.get(reason, "low"))
+        grouped[reason] = {
+            "reason": reason,
+            "severity": severity,
+            "hint": item.get("hint", SKIP_REASON_HINTS.get(reason, "Review scan filters and file accessibility.")),
+            "count": 1,
+        }
+    return sorted(
+        grouped.values(),
+        key=lambda item: (
+            -SEVERITY_RANK.get(item["severity"], 1),
+            -item["count"],
+            item["reason"],
         ),
     )
 
@@ -477,6 +661,7 @@ def resolve_context_with_metadata(
         "included_files": [],
         "skipped_files": [],
         "skip_summary": {"by_reason": {}, "by_severity": {"high": 0, "medium": 0, "low": 0}},
+        "remediation_hints": [],
         "from_git": {"requested": from_git, "included": False, "reason": ""},
     }
 
@@ -532,6 +717,7 @@ def resolve_context_with_metadata(
 
     scan["skipped_files"] = sort_skips_by_severity(scan["skipped_files"])
     scan["skip_summary"] = summarize_skips(scan["skipped_files"])
+    scan["remediation_hints"] = summarize_remediation_hints(scan["skipped_files"])
 
     return "\n\n".join(parts).strip(), scan
 
@@ -569,6 +755,7 @@ def format_scan_metadata(scan: dict) -> str:
     lines = []
     skip_summary = scan.get("skip_summary", summarize_skips(scan["skipped_files"]))
     skipped_files = sort_skips_by_severity(scan["skipped_files"])
+    remediation_hints = scan.get("remediation_hints", summarize_remediation_hints(skipped_files))
 
     lines.append("## Scan Metadata")
     lines.append(f"1. Included files: {len(scan['included_files'])}")
@@ -602,6 +789,13 @@ def format_scan_metadata(scan: dict) -> str:
             sev = SKIP_REASON_SEVERITY.get(reason, "low")
             lines.append(f"- {reason}: {count} ({sev})")
 
+    if remediation_hints:
+        lines.append("\nRecommended Remediations:")
+        for item in remediation_hints[:5]:
+            lines.append(
+                f"- {item['reason']} ({item['severity']}, count={item['count']}): {item['hint']}"
+            )
+
     if scan["included_files"]:
         lines.append("\nIncluded File Paths:")
         for path in scan["included_files"]:
@@ -611,7 +805,7 @@ def format_scan_metadata(scan: dict) -> str:
         lines.append("\nSkipped File Paths:")
         for item in skipped_files:
             lines.append(
-                f"- {item['path']} [{item['reason']}] severity={item['severity']}"
+                f"- {item['path']} [{item['reason']}] severity={item['severity']} hint={item['hint']}"
             )
 
     return "\n".join(lines)
@@ -695,6 +889,24 @@ def main() -> None:
         action="store_true",
         help="Show metadata for ingested and skipped files.",
     )
+    parser.add_argument(
+        "--weights-file",
+        type=str,
+        default="",
+        help="JSON scoring config overrides (action scores, signal patterns, boosts).",
+    )
+    parser.add_argument(
+        "--snapshot-out",
+        type=str,
+        default="",
+        help="Write a JSON snapshot artifact (prediction + metadata) to this path.",
+    )
+    parser.add_argument(
+        "--snapshot-tag",
+        type=str,
+        default="",
+        help="Optional label included in snapshot metadata.",
+    )
 
     args = parser.parse_args()
 
@@ -714,20 +926,18 @@ def main() -> None:
     if not context:
         context = input("Paste context: ").strip()
 
-    predictor = DigitalTwinPredictor()
+    scoring_config = None
+    if args.weights_file.strip():
+        try:
+            scoring_config = load_scoring_config_file(args.weights_file.strip())
+        except ValueError as exc:
+            raise SystemExit(f"Invalid --weights-file: {exc}") from exc
+
+    predictor = DigitalTwinPredictor(scoring_config=scoring_config)
     report = predictor.predict(context)
+    payload = build_prediction_payload(report=report, include_scan=args.show_scan, scan=scan)
 
     if args.json:
-        payload = {
-            "likely_next_actions": [item.__dict__ for item in report.likely_next_actions],
-            "current_intent_inference": report.current_intent_inference,
-            "decision_predictions": report.decision_predictions,
-            "style_deviations_detected": report.style_deviations_detected,
-            "reasoning_trace": report.reasoning_trace,
-            "alternative_paths": [item.__dict__ for item in report.alternative_paths],
-        }
-        if args.show_scan:
-            payload["scan"] = scan
         print(
             json.dumps(
                 payload,
@@ -739,6 +949,20 @@ def main() -> None:
         if args.show_scan:
             print()
             print(format_scan_metadata(scan))
+
+    if args.snapshot_out.strip():
+        snapshot = build_snapshot_document(
+            prediction_payload=payload,
+            context=context,
+            snapshot_tag=args.snapshot_tag,
+            weights_file=args.weights_file,
+            show_scan=args.show_scan,
+        )
+        try:
+            output_path = write_snapshot_file(args.snapshot_out.strip(), snapshot)
+        except ValueError as exc:
+            raise SystemExit(f"Invalid --snapshot-out: {exc}") from exc
+        print(f"snapshot written: {output_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
