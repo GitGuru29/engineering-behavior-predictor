@@ -1,9 +1,13 @@
 import unittest
 import tempfile
+import json
+import hashlib
 from pathlib import Path
 import os
 
 from src.predictor import (
+    build_prediction_payload,
+    build_snapshot_document,
     DigitalTwinPredictor,
     discover_context_files,
     discover_context_files_with_metadata,
@@ -11,6 +15,7 @@ from src.predictor import (
     load_scoring_config_file,
     resolve_context,
     resolve_context_with_metadata,
+    write_snapshot_file,
 )
 
 
@@ -175,6 +180,8 @@ class PredictorTests(unittest.TestCase):
             self.assertIn("missing_or_not_file", reasons)
             self.assertIn("skip_summary", scan)
             self.assertIn("by_severity", scan["skip_summary"])
+            self.assertIn("remediation_hints", scan)
+            self.assertTrue(scan["remediation_hints"])
 
     def test_skip_severity_prioritization(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -186,6 +193,7 @@ class PredictorTests(unittest.TestCase):
             self.assertFalse(included)
             self.assertEqual(skipped[0]["reason"], "missing_or_not_directory")
             self.assertEqual(skipped[0]["severity"], "high")
+            self.assertIn("hint", skipped[0])
 
     def test_format_scan_metadata_includes_severity_counts(self):
         scan = {
@@ -196,23 +204,41 @@ class PredictorTests(unittest.TestCase):
                     "reason": "over_max_bytes",
                     "severity": "medium",
                     "severity_score": 2,
+                    "hint": "Increase --dir-max-bytes or narrow file patterns.",
                 },
                 {
                     "path": "c.log",
                     "reason": "read_error",
                     "severity": "high",
                     "severity_score": 3,
+                    "hint": "Verify file permissions and file encoding before rerunning.",
                 },
             ],
             "skip_summary": {
                 "by_reason": {"over_max_bytes": 1, "read_error": 1},
                 "by_severity": {"high": 1, "medium": 1, "low": 0},
             },
+            "remediation_hints": [
+                {
+                    "reason": "read_error",
+                    "severity": "high",
+                    "hint": "Verify file permissions and file encoding before rerunning.",
+                    "count": 1,
+                },
+                {
+                    "reason": "over_max_bytes",
+                    "severity": "medium",
+                    "hint": "Increase --dir-max-bytes or narrow file patterns.",
+                    "count": 1,
+                },
+            ],
             "from_git": {"requested": False, "included": False, "reason": ""},
         }
         formatted = format_scan_metadata(scan)
         self.assertIn("high=1, medium=1, low=0", formatted)
         self.assertIn("severity=high", formatted)
+        self.assertIn("Recommended Remediations:", formatted)
+        self.assertIn("Verify file permissions", formatted)
         self.assertLess(formatted.index("c.log"), formatted.index("b.log"))
 
     def test_custom_scoring_config_changes_ranking(self):
@@ -238,6 +264,45 @@ class PredictorTests(unittest.TestCase):
             loaded = load_scoring_config_file(str(path))
             self.assertIn("action_base_scores", loaded)
             self.assertEqual(loaded["signal_patterns"]["benchmark"], "fps|frametime")
+
+    def test_build_snapshot_document_contains_context_hash(self):
+        context = "regression in db query latency"
+        report = self.p.predict(context)
+        payload = build_prediction_payload(report=report, include_scan=False, scan={})
+        snapshot = build_snapshot_document(
+            prediction_payload=payload,
+            context=context,
+            snapshot_tag="nightly",
+            weights_file="config/weights.local.json",
+            show_scan=False,
+        )
+        self.assertEqual(snapshot["tag"], "nightly")
+        self.assertEqual(
+            snapshot["context_sha256"], hashlib.sha256(context.encode("utf-8")).hexdigest()
+        )
+        self.assertEqual(snapshot["context_length_chars"], len(context))
+        self.assertIn("prediction", snapshot)
+        self.assertEqual(
+            snapshot["run_config"]["weights_file"], "config/weights.local.json"
+        )
+
+    def test_write_snapshot_file_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "snapshots" / "one.json"
+            snapshot = {
+                "schema_version": 1,
+                "generated_at_utc": "2026-01-01T00:00:00Z",
+                "tag": "test",
+                "context_sha256": "abc",
+                "context_length_chars": 3,
+                "run_config": {"weights_file": "", "show_scan": False},
+                "prediction": {"current_intent_inference": "x"},
+            }
+            written = write_snapshot_file(str(output), snapshot)
+            self.assertEqual(written, str(output))
+            loaded = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(loaded["tag"], "test")
+            self.assertEqual(loaded["prediction"]["current_intent_inference"], "x")
 
 
 if __name__ == "__main__":

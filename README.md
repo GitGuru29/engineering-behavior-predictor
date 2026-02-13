@@ -79,6 +79,17 @@ python3 src/predictor.py --from-dir . --show-scan --json
 
 `--show-scan` now includes skip severity counts (`high`, `medium`, `low`) and
 prioritizes high-severity skip reasons first.
+It also prints recommended remediations for each skip reason.
+
+Export reproducible prediction snapshots:
+
+```bash
+python3 src/predictor.py \
+  --from-dir . \
+  --show-scan \
+  --snapshot-out snapshots/run-001.json \
+  --snapshot-tag "baseline"
+```
 
 Combine manual context + files + recent git history:
 
@@ -99,5 +110,5 @@ python3 -m unittest -v tests/test_predictor.py
 ## Next engineering increments
 
 1. Add context adapters (git commits, issue text, benchmark logs).
-2. Add remediation hints for scan skips.
+2. Add snapshot diff utility for cross-run comparison.
 3. Add regression corpus and calibration checks for probability stability.

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import argparse
+from datetime import datetime, timezone
 import fnmatch
+import hashlib
 import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 from typing import List
 
 
@@ -44,6 +47,19 @@ SKIP_REASON_SEVERITY = {
     "ignored_pattern": "low",
     "duplicate_candidate": "low",
     "not_a_file": "low",
+}
+SKIP_REASON_HINTS = {
+    "read_error": "Verify file permissions and file encoding before rerunning.",
+    "stat_error": "Check filesystem access and retry with accessible paths.",
+    "missing_or_not_directory": "Fix --from-dir path or create the target directory.",
+    "missing_or_not_file": "Fix file path typos or regenerate missing artifact files.",
+    "over_max_bytes": "Increase --dir-max-bytes or narrow file patterns.",
+    "over_max_files": "Increase --dir-max-files or tighten --dir-patterns.",
+    "empty_file": "Regenerate logs/notes so files contain meaningful context.",
+    "ignored_dir": "Remove directory from --ignore-dirs if it must be scanned.",
+    "ignored_pattern": "Adjust --ignore-patterns to include this file.",
+    "duplicate_candidate": "Remove duplicate file inputs from --from-files.",
+    "not_a_file": "Provide only regular files, not directories or device paths.",
 }
 DEFAULT_ACTION_SCORES = {
     "Write or update a concise architecture/design note before large edits": 0.58,
@@ -190,6 +206,54 @@ def load_scoring_config_file(path: str) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("top-level json value must be an object")
     return build_scoring_config(payload)
+
+
+def build_prediction_payload(report: PredictionReport, include_scan: bool, scan: dict) -> dict:
+    payload = {
+        "likely_next_actions": [item.__dict__ for item in report.likely_next_actions],
+        "current_intent_inference": report.current_intent_inference,
+        "decision_predictions": report.decision_predictions,
+        "style_deviations_detected": report.style_deviations_detected,
+        "reasoning_trace": report.reasoning_trace,
+        "alternative_paths": [item.__dict__ for item in report.alternative_paths],
+    }
+    if include_scan:
+        payload["scan"] = scan
+    return payload
+
+
+def build_snapshot_document(
+    prediction_payload: dict,
+    context: str,
+    snapshot_tag: str = "",
+    weights_file: str = "",
+    show_scan: bool = False,
+) -> dict:
+    context_hash = hashlib.sha256(context.encode("utf-8")).hexdigest()
+    return {
+        "schema_version": 1,
+        "generated_at_utc": (
+            datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        ),
+        "tag": snapshot_tag.strip(),
+        "context_sha256": context_hash,
+        "context_length_chars": len(context),
+        "run_config": {
+            "weights_file": weights_file.strip(),
+            "show_scan": bool(show_scan),
+        },
+        "prediction": prediction_payload,
+    }
+
+
+def write_snapshot_file(path: str, snapshot: dict) -> str:
+    file_path = Path(path)
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"failed to write snapshot: {exc}") from exc
+    return str(file_path)
 
 
 class DigitalTwinPredictor:
@@ -374,11 +438,13 @@ class DigitalTwinPredictor:
 
 def _skip(path: str, reason: str) -> dict:
     severity = SKIP_REASON_SEVERITY.get(reason, "low")
+    hint = SKIP_REASON_HINTS.get(reason, "Review scan filters and file accessibility.")
     return {
         "path": path,
         "reason": reason,
         "severity": severity,
         "severity_score": SEVERITY_RANK[severity],
+        "hint": hint,
     }
 
 
@@ -406,6 +472,30 @@ def sort_skips_by_severity(skipped_files: List[dict]) -> List[dict]:
             ),
             item.get("reason", ""),
             item.get("path", ""),
+        ),
+    )
+
+
+def summarize_remediation_hints(skipped_files: List[dict]) -> List[dict]:
+    grouped = {}
+    for item in skipped_files:
+        reason = item.get("reason", "unknown")
+        if reason in grouped:
+            grouped[reason]["count"] += 1
+            continue
+        severity = item.get("severity", SKIP_REASON_SEVERITY.get(reason, "low"))
+        grouped[reason] = {
+            "reason": reason,
+            "severity": severity,
+            "hint": item.get("hint", SKIP_REASON_HINTS.get(reason, "Review scan filters and file accessibility.")),
+            "count": 1,
+        }
+    return sorted(
+        grouped.values(),
+        key=lambda item: (
+            -SEVERITY_RANK.get(item["severity"], 1),
+            -item["count"],
+            item["reason"],
         ),
     )
 
@@ -571,6 +661,7 @@ def resolve_context_with_metadata(
         "included_files": [],
         "skipped_files": [],
         "skip_summary": {"by_reason": {}, "by_severity": {"high": 0, "medium": 0, "low": 0}},
+        "remediation_hints": [],
         "from_git": {"requested": from_git, "included": False, "reason": ""},
     }
 
@@ -626,6 +717,7 @@ def resolve_context_with_metadata(
 
     scan["skipped_files"] = sort_skips_by_severity(scan["skipped_files"])
     scan["skip_summary"] = summarize_skips(scan["skipped_files"])
+    scan["remediation_hints"] = summarize_remediation_hints(scan["skipped_files"])
 
     return "\n\n".join(parts).strip(), scan
 
@@ -663,6 +755,7 @@ def format_scan_metadata(scan: dict) -> str:
     lines = []
     skip_summary = scan.get("skip_summary", summarize_skips(scan["skipped_files"]))
     skipped_files = sort_skips_by_severity(scan["skipped_files"])
+    remediation_hints = scan.get("remediation_hints", summarize_remediation_hints(skipped_files))
 
     lines.append("## Scan Metadata")
     lines.append(f"1. Included files: {len(scan['included_files'])}")
@@ -696,6 +789,13 @@ def format_scan_metadata(scan: dict) -> str:
             sev = SKIP_REASON_SEVERITY.get(reason, "low")
             lines.append(f"- {reason}: {count} ({sev})")
 
+    if remediation_hints:
+        lines.append("\nRecommended Remediations:")
+        for item in remediation_hints[:5]:
+            lines.append(
+                f"- {item['reason']} ({item['severity']}, count={item['count']}): {item['hint']}"
+            )
+
     if scan["included_files"]:
         lines.append("\nIncluded File Paths:")
         for path in scan["included_files"]:
@@ -705,7 +805,7 @@ def format_scan_metadata(scan: dict) -> str:
         lines.append("\nSkipped File Paths:")
         for item in skipped_files:
             lines.append(
-                f"- {item['path']} [{item['reason']}] severity={item['severity']}"
+                f"- {item['path']} [{item['reason']}] severity={item['severity']} hint={item['hint']}"
             )
 
     return "\n".join(lines)
@@ -795,6 +895,18 @@ def main() -> None:
         default="",
         help="JSON scoring config overrides (action scores, signal patterns, boosts).",
     )
+    parser.add_argument(
+        "--snapshot-out",
+        type=str,
+        default="",
+        help="Write a JSON snapshot artifact (prediction + metadata) to this path.",
+    )
+    parser.add_argument(
+        "--snapshot-tag",
+        type=str,
+        default="",
+        help="Optional label included in snapshot metadata.",
+    )
 
     args = parser.parse_args()
 
@@ -823,18 +935,9 @@ def main() -> None:
 
     predictor = DigitalTwinPredictor(scoring_config=scoring_config)
     report = predictor.predict(context)
+    payload = build_prediction_payload(report=report, include_scan=args.show_scan, scan=scan)
 
     if args.json:
-        payload = {
-            "likely_next_actions": [item.__dict__ for item in report.likely_next_actions],
-            "current_intent_inference": report.current_intent_inference,
-            "decision_predictions": report.decision_predictions,
-            "style_deviations_detected": report.style_deviations_detected,
-            "reasoning_trace": report.reasoning_trace,
-            "alternative_paths": [item.__dict__ for item in report.alternative_paths],
-        }
-        if args.show_scan:
-            payload["scan"] = scan
         print(
             json.dumps(
                 payload,
@@ -846,6 +949,20 @@ def main() -> None:
         if args.show_scan:
             print()
             print(format_scan_metadata(scan))
+
+    if args.snapshot_out.strip():
+        snapshot = build_snapshot_document(
+            prediction_payload=payload,
+            context=context,
+            snapshot_tag=args.snapshot_tag,
+            weights_file=args.weights_file,
+            show_scan=args.show_scan,
+        )
+        try:
+            output_path = write_snapshot_file(args.snapshot_out.strip(), snapshot)
+        except ValueError as exc:
+            raise SystemExit(f"Invalid --snapshot-out: {exc}") from exc
+        print(f"snapshot written: {output_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
