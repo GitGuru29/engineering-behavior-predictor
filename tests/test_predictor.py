@@ -1,0 +1,219 @@
+import unittest
+import tempfile
+from pathlib import Path
+import os
+
+from src.predictor import (
+    DigitalTwinPredictor,
+    discover_context_files,
+    discover_context_files_with_metadata,
+    format_scan_metadata,
+    resolve_context,
+    resolve_context_with_metadata,
+)
+
+
+class PredictorTests(unittest.TestCase):
+    def setUp(self):
+        self.p = DigitalTwinPredictor()
+
+    def test_bug_and_perf_intent(self):
+        context = "Regression after cache rewrite. Latency increased and error traces show timeout failures."
+        report = self.p.predict(context)
+        self.assertIn("stabilize correctness", report.current_intent_inference.lower())
+        self.assertEqual(len(report.likely_next_actions), 6)
+
+    def test_framework_deviation_detection(self):
+        context = "We should add another framework and boilerplate-heavy stack."
+        report = self.p.predict(context)
+        self.assertTrue(report.style_deviations_detected)
+
+    def test_architecture_signal(self):
+        context = "Need an ADR and architecture update for long-term roadmap."
+        report = self.p.predict(context)
+        top_titles = [x.title.lower() for x in report.likely_next_actions[:2]]
+        self.assertTrue(any("architecture/design note" in t for t in top_titles))
+
+    def test_resolve_context_from_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f1 = Path(tmp) / "notes.txt"
+            f2 = Path(tmp) / "logs.txt"
+            f1.write_text("Architecture ADR pending", encoding="utf-8")
+            f2.write_text("Latency regression in service", encoding="utf-8")
+
+            merged = resolve_context(
+                inline_context="",
+                from_files=[str(f1), str(f2)],
+                from_git=False,
+            )
+
+            self.assertIn("[file:", merged)
+            self.assertIn("Architecture ADR pending", merged)
+            self.assertIn("Latency regression in service", merged)
+
+    def test_discover_context_files_recent_first_with_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p1 = Path(tmp) / "old.log"
+            p2 = Path(tmp) / "newer.md"
+            p3 = Path(tmp) / "newest.txt"
+            p4 = Path(tmp) / "ignore.json"
+            p1.write_text("old", encoding="utf-8")
+            p2.write_text("newer", encoding="utf-8")
+            p3.write_text("newest", encoding="utf-8")
+            p4.write_text("json", encoding="utf-8")
+
+            now = 1_700_000_000
+            os.utime(p1, (now - 30, now - 30))
+            os.utime(p2, (now - 20, now - 20))
+            os.utime(p3, (now - 10, now - 10))
+            os.utime(p4, (now - 5, now - 5))
+
+            picked = discover_context_files(
+                from_dir=tmp,
+                patterns=["*.log", "*.md", "*.txt"],
+                max_files=2,
+                recursive=False,
+            )
+            self.assertEqual(len(picked), 2)
+            self.assertTrue(picked[0].endswith("newest.txt"))
+            self.assertTrue(picked[1].endswith("newer.md"))
+
+    def test_resolve_context_from_dir_recursive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = Path(tmp) / "nested"
+            sub.mkdir()
+            fp = sub / "debug.log"
+            fp.write_text("DB timeout seen in trace", encoding="utf-8")
+
+            merged = resolve_context(
+                inline_context="",
+                from_dir=tmp,
+                dir_patterns=["*.log"],
+                dir_max_files=5,
+                dir_recursive=True,
+            )
+            self.assertIn("DB timeout seen in trace", merged)
+
+    def test_discover_context_files_respects_max_file_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            small = Path(tmp) / "small.log"
+            large = Path(tmp) / "large.log"
+            small.write_text("ok", encoding="utf-8")
+            large.write_text("x" * 50, encoding="utf-8")
+
+            picked = discover_context_files(
+                from_dir=tmp,
+                patterns=["*.log"],
+                max_files=10,
+                recursive=False,
+                max_file_bytes=10,
+            )
+            self.assertEqual(len(picked), 1)
+            self.assertTrue(picked[0].endswith("small.log"))
+
+    def test_discover_context_files_respects_ignore_patterns_and_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            keep = Path(tmp) / "keep.log"
+            skip_by_name = Path(tmp) / "skip-me.log"
+            blocked_dir = Path(tmp) / "node_modules"
+            blocked_dir.mkdir()
+            skip_by_dir = blocked_dir / "module.log"
+
+            keep.write_text("keep", encoding="utf-8")
+            skip_by_name.write_text("skip", encoding="utf-8")
+            skip_by_dir.write_text("skip", encoding="utf-8")
+
+            picked = discover_context_files(
+                from_dir=tmp,
+                patterns=["*.log"],
+                max_files=10,
+                recursive=True,
+                ignore_patterns=["skip-*"],
+                ignore_dirs=["node_modules"],
+            )
+            self.assertEqual(len(picked), 1)
+            self.assertTrue(picked[0].endswith("keep.log"))
+
+    def test_discover_context_files_with_metadata_reports_over_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p1 = Path(tmp) / "a.log"
+            p2 = Path(tmp) / "b.log"
+            p1.write_text("a", encoding="utf-8")
+            p2.write_text("b", encoding="utf-8")
+            now = 1_700_000_000
+            os.utime(p1, (now - 20, now - 20))
+            os.utime(p2, (now - 10, now - 10))
+
+            included, skipped = discover_context_files_with_metadata(
+                from_dir=tmp,
+                patterns=["*.log"],
+                max_files=1,
+                recursive=False,
+            )
+            self.assertEqual(len(included), 1)
+            self.assertTrue(any(item["reason"] == "over_max_files" for item in skipped))
+
+    def test_resolve_context_with_metadata_reports_skips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            keep = Path(tmp) / "keep.log"
+            empty = Path(tmp) / "empty.log"
+            keep.write_text("timeout in db query", encoding="utf-8")
+            empty.write_text("", encoding="utf-8")
+            missing = Path(tmp) / "missing.log"
+
+            context, scan = resolve_context_with_metadata(
+                inline_context="",
+                from_files=[str(keep), str(empty), str(missing)],
+                from_git=False,
+            )
+
+            self.assertIn("timeout in db query", context)
+            self.assertIn(str(keep), scan["included_files"])
+            reasons = {item["reason"] for item in scan["skipped_files"]}
+            self.assertIn("empty_file", reasons)
+            self.assertIn("missing_or_not_file", reasons)
+            self.assertIn("skip_summary", scan)
+            self.assertIn("by_severity", scan["skip_summary"])
+
+    def test_skip_severity_prioritization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_dir = Path(tmp) / "does-not-exist"
+            included, skipped = discover_context_files_with_metadata(
+                from_dir=str(missing_dir),
+                patterns=["*.log"],
+            )
+            self.assertFalse(included)
+            self.assertEqual(skipped[0]["reason"], "missing_or_not_directory")
+            self.assertEqual(skipped[0]["severity"], "high")
+
+    def test_format_scan_metadata_includes_severity_counts(self):
+        scan = {
+            "included_files": ["a.log"],
+            "skipped_files": [
+                {
+                    "path": "b.log",
+                    "reason": "over_max_bytes",
+                    "severity": "medium",
+                    "severity_score": 2,
+                },
+                {
+                    "path": "c.log",
+                    "reason": "read_error",
+                    "severity": "high",
+                    "severity_score": 3,
+                },
+            ],
+            "skip_summary": {
+                "by_reason": {"over_max_bytes": 1, "read_error": 1},
+                "by_severity": {"high": 1, "medium": 1, "low": 0},
+            },
+            "from_git": {"requested": False, "included": False, "reason": ""},
+        }
+        formatted = format_scan_metadata(scan)
+        self.assertIn("high=1, medium=1, low=0", formatted)
+        self.assertIn("severity=high", formatted)
+        self.assertLess(formatted.index("c.log"), formatted.index("b.log"))
+
+
+if __name__ == "__main__":
+    unittest.main()
