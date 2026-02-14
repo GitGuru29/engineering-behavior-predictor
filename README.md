@@ -60,6 +60,10 @@ python3 src/predictor.py \
 
 This mode uses that project's files + commit history to produce both
 near-term predictions and ranked future improvements.
+Android/Kotlin projects are auto-detected and receive mobile-specific
+future improvements (Compose/UI tests, startup baseline profiles, release health).
+When `--from-git` is enabled, recently changed files are automatically prioritized.
+Tune this with `--git-file-focus-limit` (set `0` to disable git-based file focus).
 
 Auto-discover recent context files from a directory:
 
