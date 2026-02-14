@@ -12,7 +12,7 @@
     "bug": "bug|regression|failure|error|panic|exception",
     "arch": "architecture|design|diagram|adr",
     "blocked": "blocked|stuck|waiting|dependency",
-    "framework": "framework|boilerplate|scaffold|library",
+    "framework": "\\bframework\\b|boilerplate|over-?engineer|heavy stack|abstraction layer",
     "long_horizon": "roadmap|research|long-term|phd|prototype",
     "logs": "log|trace|stack",
     "db": "db|database|query|index|storage"

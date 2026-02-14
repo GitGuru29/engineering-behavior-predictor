@@ -47,6 +47,8 @@ SKIP_REASON_SEVERITY = {
     "ignored_pattern": "low",
     "duplicate_candidate": "low",
     "not_a_file": "low",
+    "outside_from_dir": "low",
+    "outside_dir_patterns": "low",
 }
 SKIP_REASON_HINTS = {
     "read_error": "Verify file permissions and file encoding before rerunning.",
@@ -60,6 +62,8 @@ SKIP_REASON_HINTS = {
     "ignored_pattern": "Adjust --ignore-patterns to include this file.",
     "duplicate_candidate": "Remove duplicate file inputs from --from-files.",
     "not_a_file": "Provide only regular files, not directories or device paths.",
+    "outside_from_dir": "Adjust --from-dir to cover these files if needed.",
+    "outside_dir_patterns": "Widen --dir-patterns if these files should be considered.",
 }
 DEFAULT_ACTION_SCORES = {
     "Write or update a concise architecture/design note before large edits": 0.58,
@@ -74,7 +78,7 @@ DEFAULT_SIGNAL_PATTERNS = {
     "bug": r"bug|regression|failure|error|panic|exception",
     "arch": r"architecture|design|diagram|adr",
     "blocked": r"blocked|stuck|waiting|dependency",
-    "framework": r"framework|boilerplate|scaffold|library",
+    "framework": r"\bframework\b|boilerplate|over-?engineer|heavy stack|abstraction layer",
     "long_horizon": r"roadmap|research|long-term|phd|prototype",
     "logs": r"log|trace|stack",
     "db": r"db|database|query|index|storage",
@@ -97,6 +101,11 @@ DEFAULT_SIGNAL_BOOSTS = {
     "long_horizon": {
         "Write or update a concise architecture/design note before large edits": 0.06,
     },
+}
+ANDROID_ACTION_PRIORS = {
+    "Add instrumentation/UI tests for critical user journeys (auth, cart, checkout)": 0.62,
+    "Profile startup and scroll performance on representative Android devices": 0.58,
+    "Harden ViewModel state and side-effect handling for Compose screens": 0.56,
 }
 
 
@@ -315,6 +324,18 @@ class DigitalTwinPredictor:
         has_recent_delivery_markers = bool(
             re.search(r"\bfeat|fix|refactor|perf|test|docs|chore\b", lctx)
         )
+        has_android = bool(
+            re.search(
+                r"androidmanifest|build\.gradle|gradle\.kts|mainactivity|viewmodel|compose|jetpack|kotlin|\.kt\b|activity|fragment|room|retrofit",
+                lctx,
+            )
+        )
+        has_ui_flows = bool(
+            re.search(r"screen|navigation|checkout|cart|auth|signin|signup", lctx)
+        )
+        has_framework_overreach = bool(
+            re.search(r"boilerplate|scaffold|over-?engineer|heavy stack|abstraction layer", lctx)
+        )
 
         if has_benchmark:
             decisions.append("Prefer measuring before rewriting; profile first, then optimize the top hotspot only.")
@@ -333,10 +354,15 @@ class DigitalTwinPredictor:
             reasoning.append("Blocker language maps to strategic task switching rather than idle context switching.")
 
         if has_framework:
-            deviations.append(
-                "Context includes framework-heavy language; baseline style usually favors lighter-weight, purpose-fit abstractions."
-            )
-            reasoning.append("Potential mismatch detected: framework reliance vs minimal-framework preference.")
+            if has_android and not has_framework_overreach:
+                reasoning.append(
+                    "Framework terms appeared in Android context without over-engineering markers; treated as neutral."
+                )
+            else:
+                deviations.append(
+                    "Context includes framework-heavy language; baseline style usually favors lighter-weight, purpose-fit abstractions."
+                )
+                reasoning.append("Potential mismatch detected: framework reliance vs minimal-framework preference.")
 
         if has_long_horizon:
             decisions.append("Bias toward modular boundaries and explicit interfaces for long-horizon maintainability.")
@@ -349,6 +375,26 @@ class DigitalTwinPredictor:
         if has_db:
             decisions.append("Evaluate query/index tradeoffs before scaling app-layer complexity.")
             reasoning.append("Storage/query terms imply system-level bottleneck analysis.")
+
+        if has_android:
+            reasoning.append("Android project signals detected (Kotlin/Gradle/Compose/ViewModel patterns).")
+            for action, base in ANDROID_ACTION_PRIORS.items():
+                action_scores[action] = action_scores.get(action, 0.0) + base
+            if has_ui_flows:
+                action_scores[
+                    "Add instrumentation/UI tests for critical user journeys (auth, cart, checkout)"
+                ] += 0.24
+            if has_benchmark:
+                action_scores[
+                    "Profile startup and scroll performance on representative Android devices"
+                ] += 0.20
+            if has_bug:
+                action_scores[
+                    "Harden ViewModel state and side-effect handling for Compose screens"
+                ] += 0.16
+            decisions.append("Treat startup, navigation, and state-management regressions as first-class mobile quality risks.")
+            if has_ui_flows:
+                decisions.append("Protect cart/checkout/auth flows with UI tests before broad feature expansion.")
 
         if not reasoning:
             reasoning.append(
@@ -376,6 +422,8 @@ class DigitalTwinPredictor:
             has_long_horizon=has_long_horizon,
             has_git_history=has_git_history,
             has_recent_delivery_markers=has_recent_delivery_markers,
+            has_android=has_android,
+            has_ui_flows=has_ui_flows,
         )
 
         return PredictionReport(
@@ -476,6 +524,8 @@ class DigitalTwinPredictor:
         has_long_horizon: bool,
         has_git_history: bool,
         has_recent_delivery_markers: bool,
+        has_android: bool,
+        has_ui_flows: bool,
     ) -> List[RankedItem]:
         improvements = [
             RankedItem(
@@ -552,6 +602,44 @@ class DigitalTwinPredictor:
                 rationale="Historical change patterns expose structural debt clusters that are best addressed intentionally.",
             ),
         ]
+
+        if has_android:
+            improvements.extend(
+                [
+                    RankedItem(
+                        title="Add macrobenchmark + baseline profile coverage for startup and critical rendering paths",
+                        probability=round(
+                            min(0.95, 0.56 + (0.16 if has_benchmark else 0.0)),
+                            2,
+                        ),
+                        rationale="Android UX quality improves significantly when startup and jank are tracked with device-level benchmarks.",
+                    ),
+                    RankedItem(
+                        title="Strengthen Compose UI testing for navigation and purchase funnels",
+                        probability=round(
+                            min(0.95, 0.54 + (0.18 if has_ui_flows else 0.0)),
+                            2,
+                        ),
+                        rationale="Instrumented UI tests catch regressions in high-value flows before release.",
+                    ),
+                    RankedItem(
+                        title="Standardize ViewModel state contracts and one-off event handling",
+                        probability=round(
+                            min(0.95, 0.50 + (0.12 if has_bug else 0.0)),
+                            2,
+                        ),
+                        rationale="Consistent UI-state modeling reduces flaky behavior and makes debugging faster in Compose apps.",
+                    ),
+                    RankedItem(
+                        title="Add release-track crash and ANR monitoring gates",
+                        probability=round(
+                            min(0.95, 0.48 + (0.14 if has_recent_delivery_markers else 0.0)),
+                            2,
+                        ),
+                        rationale="Mobile delivery cadence benefits from release health gates that block risky rollouts early.",
+                    ),
+                ]
+            )
 
         return sorted(improvements, key=lambda x: x.probability, reverse=True)[:5]
 
@@ -768,6 +856,50 @@ def gather_git_context(max_commits: int = 8, repo_dir: str | None = None) -> str
     return f"[git-log:last-{max_commits}-commits]\n{output}"
 
 
+def gather_git_changed_files(max_commits: int = 20, repo_dir: str | None = None) -> List[str]:
+    cmd = ["git"]
+    if repo_dir:
+        cmd.extend(["-C", repo_dir])
+    cmd.extend(
+        [
+            "log",
+            f"--max-count={max_commits}",
+            "--name-only",
+            "--pretty=format:",
+        ]
+    )
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return []
+
+    if result.returncode != 0:
+        return []
+
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    base = Path(repo_dir).resolve() if repo_dir else None
+    files = []
+    seen = set()
+    for raw in lines:
+        path = Path(raw)
+        if base and not path.is_absolute():
+            path = base / path
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        files.append(key)
+    return files
+
+
 def resolve_context_with_metadata(
     inline_context: str,
     from_files: List[str] | None = None,
@@ -780,6 +912,7 @@ def resolve_context_with_metadata(
     dir_ignore_dirs: List[str] | None = None,
     from_git: bool = False,
     git_commits: int = 8,
+    git_file_focus_limit: int = 30,
     git_repo_dir: str | None = None,
 ) -> tuple[str, dict]:
     parts = []
@@ -788,6 +921,7 @@ def resolve_context_with_metadata(
         "skipped_files": [],
         "skip_summary": {"by_reason": {}, "by_severity": {"high": 0, "medium": 0, "low": 0}},
         "remediation_hints": [],
+        "git_focus_files": 0,
         "from_git": {"requested": from_git, "included": False, "reason": ""},
     }
 
@@ -797,11 +931,78 @@ def resolve_context_with_metadata(
 
     candidate_files = []
     dedupe_seen = set()
+    if from_git and git_file_focus_limit > 0:
+        scope_dir = Path(from_dir).resolve() if from_dir else None
+        repo_base = Path(git_repo_dir).resolve() if git_repo_dir else None
+        ignore_patterns = dir_ignore_patterns or []
+        ignore_dirs_set = set(dir_ignore_dirs or [])
+        active_patterns = dir_patterns or []
+        focused = gather_git_changed_files(
+            max_commits=max(git_commits, 1),
+            repo_dir=git_repo_dir,
+        )[: max(git_file_focus_limit, 1)]
+        accepted_focus = 0
+        for raw in focused:
+            path = Path(raw)
+            key = str(path)
+            if not path.exists() or not path.is_file():
+                scan["skipped_files"].append(_skip(key, "missing_or_not_file"))
+                continue
+
+            rel_for_filters = path.as_posix()
+            rel_parts = path.parts
+            if repo_base:
+                try:
+                    rel_obj = path.relative_to(repo_base)
+                    rel_for_filters = rel_obj.as_posix()
+                    rel_parts = rel_obj.parts
+                except ValueError:
+                    pass
+
+            if scope_dir:
+                try:
+                    path.relative_to(scope_dir)
+                except ValueError:
+                    scan["skipped_files"].append(_skip(key, "outside_from_dir"))
+                    continue
+
+            if any(part in ignore_dirs_set for part in rel_parts):
+                scan["skipped_files"].append(_skip(key, "ignored_dir"))
+                continue
+
+            if ignore_patterns and (
+                any(fnmatch.fnmatch(path.name, p) for p in ignore_patterns)
+                or any(fnmatch.fnmatch(rel_for_filters, p) for p in ignore_patterns)
+            ):
+                scan["skipped_files"].append(_skip(key, "ignored_pattern"))
+                continue
+
+            if active_patterns and not (
+                any(fnmatch.fnmatch(path.name, p) for p in active_patterns)
+                or any(fnmatch.fnmatch(rel_for_filters, p) for p in active_patterns)
+            ):
+                scan["skipped_files"].append(_skip(key, "outside_dir_patterns"))
+                continue
+
+            try:
+                stat = path.stat()
+            except OSError:
+                scan["skipped_files"].append(_skip(key, "stat_error"))
+                continue
+            if stat.st_size > max(dir_max_bytes, 1):
+                scan["skipped_files"].append(_skip(key, "over_max_bytes"))
+                continue
+            if key in dedupe_seen:
+                continue
+            dedupe_seen.add(key)
+            candidate_files.append(key)
+            accepted_focus += 1
+        scan["git_focus_files"] = accepted_focus
+
     if from_files:
         for raw in from_files:
             key = str(Path(raw))
             if key in dedupe_seen:
-                scan["skipped_files"].append(_skip(key, "duplicate_candidate"))
                 continue
             dedupe_seen.add(key)
             candidate_files.append(key)
@@ -819,7 +1020,6 @@ def resolve_context_with_metadata(
         for raw in discovered_files:
             key = str(Path(raw))
             if key in dedupe_seen:
-                scan["skipped_files"].append(_skip(key, "duplicate_candidate"))
                 continue
             dedupe_seen.add(key)
             candidate_files.append(key)
@@ -860,6 +1060,7 @@ def resolve_context(
     dir_ignore_dirs: List[str] | None = None,
     from_git: bool = False,
     git_commits: int = 8,
+    git_file_focus_limit: int = 30,
     git_repo_dir: str | None = None,
 ) -> str:
     context, _ = resolve_context_with_metadata(
@@ -874,6 +1075,7 @@ def resolve_context(
         dir_ignore_dirs=dir_ignore_dirs,
         from_git=from_git,
         git_commits=git_commits,
+        git_file_focus_limit=git_file_focus_limit,
         git_repo_dir=git_repo_dir,
     )
     return context
@@ -906,6 +1108,8 @@ def format_scan_metadata(scan: dict) -> str:
         )
     )
     lines.append(f"4. Git context: {git_msg}")
+    if scan.get("git_focus_files", 0):
+        lines.append(f"5. Git-focused files injected: {scan['git_focus_files']}")
 
     if skip_summary["by_reason"]:
         lines.append("\nTop Skip Reasons:")
@@ -1019,6 +1223,12 @@ def main() -> None:
         help="How many recent commits to ingest when using --from-git.",
     )
     parser.add_argument(
+        "--git-file-focus-limit",
+        type=int,
+        default=30,
+        help="When using --from-git, prioritize this many recently changed files into context.",
+    )
+    parser.add_argument(
         "--show-scan",
         action="store_true",
         help="Show metadata for ingested and skipped files.",
@@ -1069,6 +1279,7 @@ def main() -> None:
         dir_ignore_dirs=args.ignore_dirs,
         from_git=args.from_git,
         git_commits=max(args.git_commits, 1),
+        git_file_focus_limit=max(args.git_file_focus_limit, 0),
         git_repo_dir=str(project_dir),
     )
     if not context:

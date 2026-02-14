@@ -12,6 +12,7 @@ from src.predictor import (
     discover_context_files,
     discover_context_files_with_metadata,
     format_scan_metadata,
+    gather_git_changed_files,
     gather_git_context,
     load_scoring_config_file,
     resolve_project_path,
@@ -38,10 +39,33 @@ class PredictorTests(unittest.TestCase):
         titles = [item.title.lower() for item in report.future_improvements]
         self.assertTrue(any("changelog/release-note generation" in t for t in titles))
 
+    def test_android_context_produces_android_specific_improvements(self):
+        context = """
+        AndroidManifest.xml
+        app/build.gradle.kts
+        MainActivity.kt
+        ViewModel
+        Compose screen navigation checkout cart auth
+        """
+        report = self.p.predict(context)
+        titles = [item.title.lower() for item in report.future_improvements]
+        self.assertTrue(any("compose ui testing" in t for t in titles))
+        self.assertTrue(any("baseline profile" in t for t in titles))
+
     def test_framework_deviation_detection(self):
         context = "We should add another framework and boilerplate-heavy stack."
         report = self.p.predict(context)
         self.assertTrue(report.style_deviations_detected)
+
+    def test_library_word_alone_not_flagged_as_framework_deviation(self):
+        context = "Using Kotlin stdlib and a shared utility library."
+        report = self.p.predict(context)
+        self.assertFalse(report.style_deviations_detected)
+
+    def test_android_framework_terms_without_overengineering_are_neutral(self):
+        context = "Android framework components in MainActivity.kt and Compose navigation."
+        report = self.p.predict(context)
+        self.assertFalse(report.style_deviations_detected)
 
     def test_architecture_signal(self):
         context = "Need an ADR and architecture update for long-term roadmap."
@@ -204,6 +228,36 @@ class PredictorTests(unittest.TestCase):
             self.assertEqual(skipped[0]["severity"], "high")
             self.assertIn("hint", skipped[0])
 
+    def test_new_skip_reason_has_hint(self):
+        scan = {
+            "included_files": [],
+            "skipped_files": [
+                {
+                    "path": "/tmp/x",
+                    "reason": "outside_from_dir",
+                    "severity": "low",
+                    "severity_score": 1,
+                    "hint": "Adjust --from-dir to cover these files if needed.",
+                }
+            ],
+            "skip_summary": {
+                "by_reason": {"outside_from_dir": 1},
+                "by_severity": {"high": 0, "medium": 0, "low": 1},
+            },
+            "remediation_hints": [
+                {
+                    "reason": "outside_from_dir",
+                    "severity": "low",
+                    "hint": "Adjust --from-dir to cover these files if needed.",
+                    "count": 1,
+                }
+            ],
+            "from_git": {"requested": True, "included": True, "reason": ""},
+            "git_focus_files": 0,
+        }
+        text = format_scan_metadata(scan)
+        self.assertIn("outside_from_dir", text)
+
     def test_format_scan_metadata_includes_severity_counts(self):
         scan = {
             "included_files": ["a.log"],
@@ -326,6 +380,11 @@ class PredictorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = gather_git_context(max_commits=3, repo_dir=tmp)
             self.assertEqual(out, "")
+
+    def test_gather_git_changed_files_for_non_repo_returns_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            files = gather_git_changed_files(max_commits=5, repo_dir=tmp)
+            self.assertEqual(files, [])
 
 
 if __name__ == "__main__":
