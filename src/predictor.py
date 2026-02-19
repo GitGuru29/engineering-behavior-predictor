@@ -103,6 +103,68 @@ DEFAULT_SIGNAL_BOOSTS = {
         "Write or update a concise architecture/design note before large edits": 0.06,
     },
 }
+SOURCE_CODE_EXTENSIONS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cs",
+    ".go",
+    ".h",
+    ".hpp",
+    ".java",
+    ".js",
+    ".kt",
+    ".kts",
+    ".m",
+    ".mm",
+    ".php",
+    ".py",
+    ".rb",
+    ".rs",
+    ".swift",
+    ".ts",
+    ".tsx",
+}
+DOC_EXTENSIONS = {".adoc", ".md", ".rst"}
+TEXT_EXTENSIONS = {".txt"}
+LOG_EXTENSIONS = {".log", ".trace"}
+CONFIG_EXTENSIONS = {".cfg", ".conf", ".ini", ".json", ".toml", ".xml", ".yaml", ".yml"}
+DEFAULT_CONTEXT_SOURCE_WEIGHTS = {
+    "inline": 1.0,
+    "git-log": 1.0,
+    "log": 1.0,
+    "text": 0.95,
+    "doc": 0.45,
+    "config": 0.35,
+    "source": 0.08,
+    "test": 0.05,
+    "other_file": 0.40,
+}
+DEFAULT_SIGNAL_THRESHOLDS = {
+    "benchmark": 0.85,
+    "bug": 0.90,
+    "arch": 0.95,
+    "blocked": 0.90,
+    "framework": 0.85,
+    "long_horizon": 0.95,
+    "logs": 0.85,
+    "db": 0.85,
+}
+EXTRA_SIGNAL_PATTERNS = {
+    "android": (
+        r"androidmanifest|build\.gradle|gradle\.kts|mainactivity|viewmodel|compose|jetpack|kotlin|"
+        r"\.kt\b|activity|fragment|room|retrofit"
+    ),
+    "ui_flows": r"screen|navigation|checkout|cart|auth|signin|signup",
+    "framework_overreach": r"boilerplate|scaffold|over-?engineer|heavy stack|abstraction layer",
+    "delivery_markers": r"\bfeat|fix|refactor|perf|test|docs|chore\b",
+}
+DEFAULT_EXTRA_SIGNAL_THRESHOLDS = {
+    "android": 0.85,
+    "ui_flows": 0.90,
+    "framework_overreach": 0.85,
+    "delivery_markers": 0.90,
+}
 ANDROID_ACTION_PRIORS = {
     "Add instrumentation/UI tests for critical user journeys (auth, cart, checkout)": 0.62,
     "Profile startup and scroll performance on representative Android devices": 0.58,
@@ -115,6 +177,14 @@ class RankedItem:
     title: str
     probability: float
     rationale: str
+
+
+@dataclass
+class ContextSection:
+    source_type: str
+    source_ref: str
+    weight: float
+    text: str
 
 
 @dataclass
@@ -609,6 +679,7 @@ def build_scoring_config(custom: dict | None = None) -> dict:
         "signal_boosts": {
             signal: dict(boosts) for signal, boosts in DEFAULT_SIGNAL_BOOSTS.items()
         },
+        "signal_thresholds": dict(DEFAULT_SIGNAL_THRESHOLDS),
     }
     if not custom:
         return config
@@ -640,6 +711,14 @@ def build_scoring_config(custom: dict | None = None) -> dict:
                 except (TypeError, ValueError):
                     continue
             config["signal_boosts"][signal_key] = current
+
+    raw_thresholds = custom.get("signal_thresholds", {})
+    if isinstance(raw_thresholds, dict):
+        for signal, threshold in raw_thresholds.items():
+            try:
+                config["signal_thresholds"][str(signal)] = max(float(threshold), 0.01)
+            except (TypeError, ValueError):
+                continue
 
     return config
 
@@ -723,6 +802,127 @@ def resolve_project_path(project_dir: str, raw_path: str) -> str:
     return str(candidate.resolve())
 
 
+def _coerce_threshold(raw_value: object, fallback: float) -> float:
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return fallback
+    return max(value, 0.01)
+
+
+def _context_source_type_for_path(path: str) -> str:
+    normalized = path.replace("\\", "/").lower()
+    name = Path(normalized).name
+    ext = Path(normalized).suffix
+
+    if (
+        "/test/" in normalized
+        or "/tests/" in normalized
+        or name.endswith("_test.py")
+        or name.endswith("test.kt")
+        or name.endswith("test.java")
+    ):
+        return "test"
+    if ext in LOG_EXTENSIONS:
+        return "log"
+    if ext in TEXT_EXTENSIONS:
+        return "text"
+    if ext in DOC_EXTENSIONS:
+        return "doc"
+    if ext in SOURCE_CODE_EXTENSIONS:
+        return "source"
+    if ext in CONFIG_EXTENSIONS:
+        return "config"
+    return "other_file"
+
+
+def _parse_context_sections(context: str) -> List[ContextSection]:
+    if not context.strip():
+        return []
+
+    file_marker_pattern = re.compile(r"^\[file:(.+)\]\s*$")
+    git_marker_pattern = re.compile(r"^\[git-log:last-\d+-commits\]\s*$", flags=re.IGNORECASE)
+    sections: List[ContextSection] = []
+    buffer: List[str] = []
+    current_source_type = "inline"
+    current_source_ref = "inline"
+    current_weight = DEFAULT_CONTEXT_SOURCE_WEIGHTS["inline"]
+
+    def flush() -> None:
+        text = "\n".join(buffer).strip()
+        if not text:
+            return
+        sections.append(
+            ContextSection(
+                source_type=current_source_type,
+                source_ref=current_source_ref,
+                weight=current_weight,
+                text=text,
+            )
+        )
+
+    for raw_line in context.splitlines():
+        file_match = file_marker_pattern.match(raw_line)
+        if file_match:
+            flush()
+            buffer = []
+            path = file_match.group(1).strip()
+            source_type = _context_source_type_for_path(path)
+            current_source_type = source_type
+            current_source_ref = path
+            current_weight = DEFAULT_CONTEXT_SOURCE_WEIGHTS[source_type]
+            continue
+
+        if git_marker_pattern.match(raw_line):
+            flush()
+            buffer = []
+            current_source_type = "git-log"
+            current_source_ref = "git-log"
+            current_weight = DEFAULT_CONTEXT_SOURCE_WEIGHTS["git-log"]
+            continue
+
+        buffer.append(raw_line)
+
+    flush()
+    return sections
+
+
+def _weighted_pattern_score(
+    pattern: str,
+    sections: List[ContextSection],
+    allowed_source_types: set[str] | None = None,
+) -> float:
+    if not pattern:
+        return 0.0
+    score = 0.0
+    for section in sections:
+        if allowed_source_types is not None and section.source_type not in allowed_source_types:
+            continue
+        if re.search(pattern, section.text.lower()):
+            score += section.weight
+    return score
+
+
+def _android_path_score(sections: List[ContextSection]) -> float:
+    score = 0.0
+    for section in sections:
+        if not section.source_ref or section.source_ref in {"inline", "git-log"}:
+            continue
+        path = section.source_ref.replace("\\", "/").lower()
+        if re.search(r"androidmanifest\.xml|build\.gradle(\.kts)?|settings\.gradle(\.kts)?", path):
+            score += 0.50
+            continue
+        if "/androidtest/" in path:
+            score += 0.45
+            continue
+        if path.endswith(".kt") or path.endswith(".java"):
+            score += 0.35
+            continue
+        if "android" in path:
+            score += 0.25
+    return min(score, 1.40)
+
+
 class DigitalTwinPredictor:
     """Deterministic, evidence-based predictor for technical work patterns."""
 
@@ -732,7 +932,7 @@ class DigitalTwinPredictor:
 
     def predict(self, context: str) -> PredictionReport:
         ctx = context.strip()
-        lctx = ctx.lower()
+        sections = _parse_context_sections(ctx)
 
         action_scores = dict(self.scoring_config["action_base_scores"])
 
@@ -740,13 +940,22 @@ class DigitalTwinPredictor:
         deviations = []
         decisions = []
 
-        # Signal extraction from context text
+        # Signal extraction from context text with source-aware confidence weighting.
+        signal_thresholds = self.scoring_config.get("signal_thresholds", {})
         signal_hits = {}
         for signal, pattern in self.scoring_config["signal_patterns"].items():
             if not pattern:
                 signal_hits[signal] = False
                 continue
-            signal_hits[signal] = bool(re.search(pattern, lctx))
+            threshold = _coerce_threshold(
+                signal_thresholds.get(
+                    signal,
+                    DEFAULT_SIGNAL_THRESHOLDS.get(signal, 0.85),
+                ),
+                DEFAULT_SIGNAL_THRESHOLDS.get(signal, 0.85),
+            )
+            score = _weighted_pattern_score(pattern, sections)
+            signal_hits[signal] = score >= threshold
 
         for signal, hit in signal_hits.items():
             if not hit:
@@ -762,21 +971,59 @@ class DigitalTwinPredictor:
         has_long_horizon = signal_hits.get("long_horizon", False)
         has_logs = signal_hits.get("logs", False)
         has_db = signal_hits.get("db", False)
-        has_git_history = "[git-log:last-" in lctx
-        has_recent_delivery_markers = bool(
-            re.search(r"\bfeat|fix|refactor|perf|test|docs|chore\b", lctx)
-        )
-        has_android = bool(
-            re.search(
-                r"androidmanifest|build\.gradle|gradle\.kts|mainactivity|viewmodel|compose|jetpack|kotlin|\.kt\b|activity|fragment|room|retrofit",
-                lctx,
+        high_signal_sources = {"inline", "git-log", "log", "text"}
+        narrative_sources = high_signal_sources | {"doc", "config", "other_file"}
+        has_git_history = any(section.source_type == "git-log" for section in sections)
+        has_recent_delivery_markers = (
+            _weighted_pattern_score(
+                EXTRA_SIGNAL_PATTERNS["delivery_markers"],
+                sections,
+                allowed_source_types=high_signal_sources,
+            )
+            >= _coerce_threshold(
+                signal_thresholds.get(
+                    "delivery_markers",
+                    DEFAULT_EXTRA_SIGNAL_THRESHOLDS["delivery_markers"],
+                ),
+                DEFAULT_EXTRA_SIGNAL_THRESHOLDS["delivery_markers"],
             )
         )
-        has_ui_flows = bool(
-            re.search(r"screen|navigation|checkout|cart|auth|signin|signup", lctx)
+        has_android = (
+            _weighted_pattern_score(
+                EXTRA_SIGNAL_PATTERNS["android"],
+                sections,
+                allowed_source_types=narrative_sources,
+            )
+            + _android_path_score(sections)
+            >= _coerce_threshold(
+                signal_thresholds.get("android", DEFAULT_EXTRA_SIGNAL_THRESHOLDS["android"]),
+                DEFAULT_EXTRA_SIGNAL_THRESHOLDS["android"],
+            )
         )
-        has_framework_overreach = bool(
-            re.search(r"boilerplate|scaffold|over-?engineer|heavy stack|abstraction layer", lctx)
+        has_ui_flows = (
+            _weighted_pattern_score(
+                EXTRA_SIGNAL_PATTERNS["ui_flows"],
+                sections,
+                allowed_source_types=narrative_sources,
+            )
+            >= _coerce_threshold(
+                signal_thresholds.get("ui_flows", DEFAULT_EXTRA_SIGNAL_THRESHOLDS["ui_flows"]),
+                DEFAULT_EXTRA_SIGNAL_THRESHOLDS["ui_flows"],
+            )
+        )
+        has_framework_overreach = (
+            _weighted_pattern_score(
+                EXTRA_SIGNAL_PATTERNS["framework_overreach"],
+                sections,
+                allowed_source_types=narrative_sources,
+            )
+            >= _coerce_threshold(
+                signal_thresholds.get(
+                    "framework_overreach",
+                    DEFAULT_EXTRA_SIGNAL_THRESHOLDS["framework_overreach"],
+                ),
+                DEFAULT_EXTRA_SIGNAL_THRESHOLDS["framework_overreach"],
+            )
         )
 
         if has_benchmark:
@@ -920,6 +1167,10 @@ class DigitalTwinPredictor:
         if has_bug:
             return (
                 "High probability objective: isolate and fix a regression quickly with minimal surface-area changes."
+            )
+        if has_benchmark:
+            return (
+                "High probability objective: isolate the dominant performance bottleneck and improve throughput with measured, low-risk changes."
             )
         return (
             "Most likely objective: progress a technically complex feature via design-first planning and pragmatic implementation increments."

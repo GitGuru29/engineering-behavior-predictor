@@ -35,5 +35,15 @@
     "long_horizon": {
       "Write or update a concise architecture/design note before large edits": 0.06
     }
+  },
+  "signal_thresholds": {
+    "benchmark": 0.85,
+    "bug": 0.9,
+    "arch": 0.95,
+    "blocked": 0.9,
+    "framework": 0.85,
+    "long_horizon": 0.95,
+    "logs": 0.85,
+    "db": 0.85
   }
 }

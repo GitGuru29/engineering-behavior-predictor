@@ -35,6 +35,9 @@ Use a custom scoring config:
 python3 src/predictor.py --context "fps dropped after refactor" --weights-file config/weights.example.json
 ```
 
+`weights.example.json` also supports `signal_thresholds` so you can require stronger evidence
+before a signal is considered active (useful when scanning large doc/code contexts).
+
 Start from template:
 
 ```bash
@@ -105,6 +108,9 @@ python3 src/predictor.py \
   --ignore-dirs .git node_modules venv __pycache__ \
   --ignore-patterns "*/archive/*" "skip-*"
 ```
+
+Context ingestion is source-aware: plain text/log inputs are weighted highest, while source/test
+files are downweighted to reduce false positives from keyword-heavy code.
 
 Show ingestion diagnostics (included/skipped files):
 
