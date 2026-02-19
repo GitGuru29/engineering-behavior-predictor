@@ -65,6 +65,24 @@ future improvements (Compose/UI tests, startup baseline profiles, release health
 When `--from-git` is enabled, recently changed files are automatically prioritized.
 Tune this with `--git-file-focus-limit` (set `0` to disable git-based file focus).
 
+Run founder-style improvement audit (7 sections) on any project:
+
+```bash
+python3 src/predictor.py \
+  --project-dir /path/to/other-project \
+  --from-dir app/src/main \
+  --dir-patterns "*.kt" "*.java" "*.xml" \
+  --from-git --git-commits 80 \
+  --founder-audit \
+  --audit-only
+```
+
+`--founder-audit` adds a concrete checklist-style audit covering:
+first impression, architecture, build/run, code quality,
+security/reliability, performance/scalability, and product thinking.
+Use `--audit-only` to print only this audit block.
+If the project is large, increase coverage with `--audit-max-files 12000`.
+
 Auto-discover recent context files from a directory:
 
 ```bash
