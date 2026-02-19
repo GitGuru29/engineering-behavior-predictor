@@ -4,6 +4,7 @@ import json
 import hashlib
 from pathlib import Path
 import os
+import textwrap
 
 from src.predictor import (
     build_founder_audit_report,
@@ -73,6 +74,49 @@ class PredictorTests(unittest.TestCase):
         report = self.p.predict(context)
         top_titles = [x.title.lower() for x in report.likely_next_actions[:2]]
         self.assertTrue(any("architecture/design note" in t for t in top_titles))
+
+    def test_source_and_docs_noise_do_not_trigger_unrelated_signals(self):
+        context = textwrap.dedent(
+            """
+            [file:/repo/src/predictor.py]
+            DEFAULT_SIGNAL_PATTERNS = {"framework": r"\\bframework\\b|boilerplate", "bug": "bug|error"}
+
+            [file:/repo/tests/test_predictor.py]
+            def test_android_context():
+                context = "AndroidManifest.xml Compose checkout cart auth"
+
+            [file:/repo/README.md]
+            architecture roadmap framework blockers and dependency notes
+
+            [file:/repo/runtime.log]
+            latency spike observed on p95 endpoint
+            """
+        )
+        report = self.p.predict(context)
+        self.assertFalse(report.style_deviations_detected)
+        self.assertIn("performance bottleneck", report.current_intent_inference.lower())
+        self.assertFalse(any("blast radius" in d.lower() for d in report.decision_predictions))
+        self.assertFalse(any("mobile quality risks" in d.lower() for d in report.decision_predictions))
+
+    def test_android_detection_from_file_path_markers(self):
+        context = textwrap.dedent(
+            """
+            [file:/repo/app/src/main/AndroidManifest.xml]
+            <manifest package="com.example.app"></manifest>
+
+            [file:/repo/app/src/main/java/com/example/MainActivity.kt]
+            class MainActivity
+            """
+        )
+        report = self.p.predict(context)
+        self.assertTrue(any("mobile quality risks" in d.lower() for d in report.decision_predictions))
+        titles = [item.title.lower() for item in report.future_improvements]
+        self.assertTrue(any("baseline profile" in title for title in titles))
+
+    def test_custom_signal_thresholds_can_reduce_noise(self):
+        predictor = DigitalTwinPredictor(scoring_config={"signal_thresholds": {"bug": 2.0}})
+        report = predictor.predict("regression and bug in checkout flow")
+        self.assertFalse(any("blast radius" in d.lower() for d in report.decision_predictions))
 
     def test_resolve_context_from_files(self):
         with tempfile.TemporaryDirectory() as tmp:
