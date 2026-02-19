@@ -6,6 +6,7 @@ from pathlib import Path
 import os
 
 from src.predictor import (
+    build_founder_audit_report,
     build_prediction_payload,
     build_snapshot_document,
     DigitalTwinPredictor,
@@ -385,6 +386,65 @@ class PredictorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             files = gather_git_changed_files(max_commits=5, repo_dir=tmp)
             self.assertEqual(files, [])
+
+    def test_founder_audit_detects_missing_readme_pitch_and_ci(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "app/src/main/java/com/example/app/ui").mkdir(parents=True)
+            (base / "app/src/main/java/com/example/app/data").mkdir(parents=True)
+            (base / "README.md").write_text(
+                "# App\n\nA short description only.",
+                encoding="utf-8",
+            )
+
+            audit = build_founder_audit_report(
+                project_dir=tmp,
+                context="AndroidManifest.xml build.gradle.kts Retrofit",
+                scan={"included_files": []},
+                ignore_dirs=[".git", "build"],
+                max_files=500,
+            )
+
+            first = audit.sections[0]
+            build_run = audit.sections[2]
+            self.assertTrue(any("Problem -> Solution -> Features -> Demo" in x for x in first.recommendations))
+            self.assertTrue(any("No CI workflow detected" in x for x in build_run.recommendations))
+
+    def test_founder_audit_markdown_has_seven_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "README.md").write_text(
+                "# Project\n\n## Features\n- x\n## Demo\nlink",
+                encoding="utf-8",
+            )
+            audit = build_founder_audit_report(
+                project_dir=tmp,
+                context="",
+                scan={"included_files": []},
+                ignore_dirs=[".git"],
+                max_files=500,
+            )
+            text = audit.to_markdown()
+            self.assertIn("1. First impression (10 seconds)", text)
+            self.assertIn("7. Product-level thinking (founder mode)", text)
+
+    def test_prediction_payload_includes_founder_audit_when_requested(self):
+        report = self.p.predict("simple context")
+        audit = build_founder_audit_report(
+            project_dir=".",
+            context="",
+            scan={"included_files": []},
+            ignore_dirs=[".git", "build", "dist", "__pycache__", "node_modules", "venv", ".venv", "target"],
+            max_files=2000,
+        )
+        payload = build_prediction_payload(
+            report=report,
+            include_scan=False,
+            scan={},
+            founder_audit=audit,
+        )
+        self.assertIn("founder_audit", payload)
+        self.assertEqual(len(payload["founder_audit"]["sections"]), 7)
 
 
 if __name__ == "__main__":

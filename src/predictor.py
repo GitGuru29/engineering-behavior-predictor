@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import fnmatch
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -167,6 +168,440 @@ class PredictionReport:
         return "\n".join(lines)
 
 
+@dataclass
+class FounderAuditSection:
+    title: str
+    recommendations: List[str]
+
+
+@dataclass
+class FounderAuditReport:
+    sections: List[FounderAuditSection]
+    analyzed_files: int
+    index_truncated: bool
+
+    def to_dict(self) -> dict:
+        return {
+            "sections": [
+                {"title": section.title, "recommendations": section.recommendations}
+                for section in self.sections
+            ],
+            "analyzed_files": self.analyzed_files,
+            "index_truncated": self.index_truncated,
+        }
+
+    def to_markdown(self) -> str:
+        lines = ["## Project Improvement Audit"]
+        for idx, section in enumerate(self.sections, start=1):
+            lines.append(f"{idx}. {section.title}")
+            for rec_idx, recommendation in enumerate(section.recommendations, start=1):
+                lines.append(f"{rec_idx}. {recommendation}")
+        lines.append(f"\nAudit coverage: {self.analyzed_files} files indexed.")
+        if self.index_truncated:
+            lines.append("Index cap reached; raise --audit-max-files for broader coverage.")
+        return "\n".join(lines)
+
+
+def _collect_repo_index(
+    project_dir: str,
+    ignore_dirs: List[str],
+    max_files: int,
+) -> tuple[List[str], bool]:
+    files = []
+    truncated = False
+    base = Path(project_dir).resolve()
+    ignore_dirs_set = set(ignore_dirs)
+
+    for root, dirs, filenames in os.walk(base):
+        dirs[:] = [d for d in dirs if d not in ignore_dirs_set]
+        root_path = Path(root)
+        for filename in filenames:
+            rel = (root_path / filename).relative_to(base).as_posix()
+            files.append(rel)
+            if len(files) >= max(max_files, 1):
+                truncated = True
+                return files, truncated
+    return files, truncated
+
+
+def _read_text_if_small(path: Path, max_bytes: int = 300_000) -> str:
+    try:
+        if path.stat().st_size > max_bytes:
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _find_repo_file(index: List[str], target_name: str) -> str:
+    target_lower = target_name.lower()
+    for rel in index:
+        if rel.lower() == target_lower:
+            return rel
+    return ""
+
+
+def _extract_android_permissions(manifest_text: str) -> List[str]:
+    return re.findall(
+        r"uses-permission[^>]*android:name=[\"']([^\"']+)[\"']",
+        manifest_text,
+        flags=re.IGNORECASE,
+    )
+
+
+def _extract_gradle_modules(settings_text: str) -> List[str]:
+    matches = re.findall(r"[\"'](:[^\"']+)[\"']", settings_text)
+    modules = []
+    seen = set()
+    for item in matches:
+        if item in seen:
+            continue
+        seen.add(item)
+        modules.append(item)
+    return modules
+
+
+def build_founder_audit_report(
+    project_dir: str,
+    context: str,
+    scan: dict,
+    ignore_dirs: List[str] | None = None,
+    max_files: int = 5000,
+) -> FounderAuditReport:
+    repo_index, truncated = _collect_repo_index(
+        project_dir=project_dir,
+        ignore_dirs=ignore_dirs or DEFAULT_IGNORED_DIRS,
+        max_files=max_files,
+    )
+    index_lower = [path.lower() for path in repo_index]
+    context_lower = context.lower()
+
+    readme_rel = _find_repo_file(repo_index, "README.md")
+    readme_text = (
+        _read_text_if_small(Path(project_dir) / readme_rel) if readme_rel else ""
+    )
+    readme_lower = readme_text.lower()
+
+    settings_rel = _find_repo_file(repo_index, "settings.gradle.kts") or _find_repo_file(
+        repo_index, "settings.gradle"
+    )
+    settings_text = (
+        _read_text_if_small(Path(project_dir) / settings_rel) if settings_rel else ""
+    )
+    modules = _extract_gradle_modules(settings_text)
+
+    manifest_rel = ""
+    for rel in repo_index:
+        if rel.lower().endswith("androidmanifest.xml"):
+            manifest_rel = rel
+            break
+    manifest_text = (
+        _read_text_if_small(Path(project_dir) / manifest_rel) if manifest_rel else ""
+    )
+    permissions = _extract_android_permissions(manifest_text)
+
+    has_gradle_files = any(
+        path.endswith("build.gradle") or path.endswith("build.gradle.kts")
+        for path in index_lower
+    )
+    has_kotlin_or_java = any(path.endswith(".kt") or path.endswith(".java") for path in index_lower)
+    has_android = bool(manifest_rel or (has_gradle_files and has_kotlin_or_java))
+    has_readme = bool(readme_rel)
+    has_problem = bool(re.search(r"\bproblem\b|pain point|challenge", readme_lower))
+    has_solution = bool(re.search(r"\bsolution\b|approach", readme_lower))
+    has_features = bool(re.search(r"\bfeatures?\b", readme_lower))
+    has_demo = bool(re.search(r"\bdemo\b|screenshot|video|gif", readme_lower))
+    has_target_user = bool(
+        re.search(r"target user|audience|who (is|this) for|for developers|for teams", readme_lower)
+    )
+    has_differentiator = bool(
+        re.search(r"\bwhy\b|differentiator|unique|compared to|vs\.", readme_lower)
+    )
+    has_roadmap = bool(re.search(r"roadmap|future work|next steps", readme_lower))
+    has_run = bool(re.search(r"getting started|setup|install|run|quick start", readme_lower))
+    has_env_example = any(
+        Path(rel).name.lower() in {".env.example", ".env.sample", ".env.template"}
+        for rel in repo_index
+    )
+    has_runtime_config = any(
+        Path(rel).name.lower()
+        in {
+            ".env",
+            "local.properties",
+            "gradle.properties",
+            "application.properties",
+            "secrets.properties",
+        }
+        for rel in repo_index
+    )
+    has_gradlew = any(Path(rel).name == "gradlew" for rel in repo_index)
+    has_ci = any(
+        rel.startswith(".github/workflows/")
+        or rel == ".gitlab-ci.yml"
+        or rel.lower() == "jenkinsfile"
+        for rel in repo_index
+    )
+    has_tests = any(
+        path.startswith("test/")
+        or path.startswith("tests/")
+        or "/test/" in path
+        or "/tests/" in path
+        or path.endswith("test.kt")
+        or path.endswith("test.java")
+        or path.endswith("_test.py")
+        for path in index_lower
+    )
+    has_ui_tests = any(
+        "/androidtest/" in path
+        or ("ui" in path and "test" in path and (path.endswith(".kt") or path.endswith(".java")))
+        for path in index_lower
+    )
+    has_lint = any(
+        Path(rel).name.lower() in {".editorconfig", "detekt.yml", "detekt.yaml", ".eslintrc", "pyproject.toml"}
+        or "ktlint" in rel.lower()
+        for rel in repo_index
+    )
+    has_benchmark = any("benchmark" in path for path in index_lower)
+    has_baseline_profile = any(
+        "baselineprofile" in path or "baseline-profile" in path for path in index_lower
+    )
+    has_cache_markers = bool(re.search(r"\bcache|memo|lru|ttl\b", context_lower))
+    has_db_markers = bool(re.search(r"\broom|sqlite|dao|database|query\b", context_lower))
+    has_network_markers = bool(re.search(r"\bretrofit|okhttp|http|api\b", context_lower))
+
+    layer_signals = {
+        "ui": any("/ui/" in path or "screen" in path for path in index_lower),
+        "domain": any(
+            "/domain/" in path or "usecase" in path or "interactor" in path for path in index_lower
+        ),
+        "data": any("/data/" in path or "/repository/" in path or "datasource" in path for path in index_lower),
+        "infra": any("/infra/" in path or "/network/" in path or "/di/" in path for path in index_lower),
+    }
+    utils_files = [
+        rel
+        for rel in repo_index
+        if "/utils/" in rel.lower() or "/util/" in rel.lower()
+    ]
+
+    large_code_files = []
+    for abs_path in scan.get("included_files", [])[:120]:
+        p = Path(abs_path)
+        if not p.exists() or not p.is_file():
+            continue
+        try:
+            line_count = len(p.read_text(encoding="utf-8", errors="replace").splitlines())
+        except OSError:
+            continue
+        if line_count >= 450:
+            large_code_files.append((str(p), line_count))
+    large_code_files.sort(key=lambda item: item[1], reverse=True)
+
+    secret_hits = re.findall(
+        r"(?im)\b(api[_-]?key|secret|token|password)\b\s*[:=]\s*[\"'][^\"']{8,}[\"']",
+        context,
+    )
+
+    first_impression = []
+    if not has_readme:
+        first_impression.append(
+            "No README.md found. Add a top section with one-line value proposition, problem, solution, and three core features."
+        )
+    else:
+        missing_top = []
+        if not has_problem:
+            missing_top.append("problem")
+        if not has_solution:
+            missing_top.append("solution")
+        if not has_features:
+            missing_top.append("features")
+        if not has_demo:
+            missing_top.append("demo")
+        if missing_top:
+            first_impression.append(
+                "README exists but top-of-file pitch is incomplete (missing: "
+                + ", ".join(missing_top)
+                + "). Rewrite first 25 lines as Problem -> Solution -> Features -> Demo."
+            )
+    if not has_demo:
+        first_impression.append(
+            "No demo evidence detected. Add 2-4 screenshots or a 30-60s walkthrough video link in README."
+        )
+    if not first_impression:
+        first_impression.append(
+            "README first impression is already strong; keep repo title/tagline and demo links synchronized with current feature scope."
+        )
+
+    project_structure = []
+    if layer_signals["ui"] and layer_signals["data"] and not layer_signals["domain"]:
+        project_structure.append(
+            "UI and data layers are visible but a domain/use-case layer is not. Add `domain/` use-case boundaries so UI does not orchestrate business logic directly."
+        )
+    if len(utils_files) >= 4:
+        project_structure.append(
+            f"`utils` appears overloaded ({len(utils_files)} files). Split by concern (e.g., `time/`, `validation/`, `platform/`) to avoid a dumping ground."
+        )
+    if modules and len(modules) <= 1 and has_android:
+        project_structure.append(
+            "Single-module Android setup detected. Introduce feature or core modules to enforce one-direction dependency flow."
+        )
+    if large_code_files:
+        biggest = large_code_files[0]
+        project_structure.append(
+            f"Large file detected ({biggest[1]} lines): `{biggest[0]}`. Break it into smaller units before adding new features."
+        )
+    if not project_structure:
+        project_structure.append(
+            "Current package split looks coherent; preserve one-direction dependency flow with module boundaries or dependency checks."
+        )
+
+    build_run = []
+    if not has_run:
+        build_run.append(
+            "README run/setup instructions are missing or weak. Add a 2-minute quickstart with exact commands and required tool versions."
+        )
+    if has_gradle_files and not has_gradlew:
+        build_run.append(
+            "Gradle wrapper is missing. Commit `gradlew` + wrapper files so contributors can run builds with a pinned Gradle version."
+        )
+    if not has_env_example and has_runtime_config and has_network_markers:
+        build_run.append(
+            "Project appears to use network/API flows but no `.env.example` detected. Add sample config keys and required defaults."
+        )
+    if not has_ci:
+        build_run.append(
+            "No CI workflow detected. Add a pipeline that runs build, unit tests, lint, and basic static checks on pull requests."
+        )
+    if not build_run:
+        build_run.append(
+            "Build/run onboarding looks healthy; keep setup docs and CI checks aligned with each release."
+        )
+
+    code_quality = []
+    if not has_tests:
+        code_quality.append(
+            "No test footprint detected. Add smoke tests first, then cover auth/cart/checkout flows with focused regression tests."
+        )
+    if has_tests and not has_ui_tests and has_android:
+        code_quality.append(
+            "Unit tests may exist but UI/instrumentation coverage is not visible. Add Android UI tests for navigation and critical user journeys."
+        )
+    if not has_lint:
+        if has_android:
+            code_quality.append(
+                "No lint/format config detected. Add detekt + ktlint (or equivalent) and enforce in CI."
+            )
+        else:
+            code_quality.append(
+                "No lint/format config detected. Add language-appropriate linting/formatting rules and enforce in CI."
+            )
+    if re.search(r"\bprint\(|\bprintln\(|system\.out\.print", context_lower):
+        code_quality.append(
+            "Raw print statements detected in scanned context. Replace with structured logging and standardized tags."
+        )
+    if not code_quality:
+        code_quality.append(
+            "Code quality signals are acceptable; next step is to tighten regression coverage around high-change files."
+        )
+
+    security_reliability = []
+    if secret_hits:
+        security_reliability.append(
+            "Potential hardcoded secret pattern found in scanned context. Move secrets to secure config and rotate exposed values."
+        )
+    if permissions:
+        risky_permissions = [
+            p
+            for p in permissions
+            if any(
+                risky in p
+                for risky in (
+                    "READ_SMS",
+                    "RECEIVE_SMS",
+                    "READ_CONTACTS",
+                    "ACCESS_FINE_LOCATION",
+                    "READ_PHONE_STATE",
+                    "WRITE_EXTERNAL_STORAGE",
+                )
+            )
+        ]
+        if risky_permissions:
+            security_reliability.append(
+                "Sensitive Android permissions detected ("
+                + ", ".join(sorted(set(risky_permissions)))
+                + "). Re-validate least-privilege and user-facing justification."
+            )
+    if has_android and not has_ui_tests and (
+        any("auth" in path for path in index_lower) or any("checkout" in path for path in index_lower)
+    ):
+        security_reliability.append(
+            "Auth/checkout surfaces exist without visible UI regression gates. Add reliability tests before shipping high-risk flows."
+        )
+    if not security_reliability:
+        security_reliability.append(
+            "No high-severity security or reliability smell detected from current scan; continue with secret scanning and permission review in CI."
+        )
+
+    performance_scalability = []
+    if has_android and not has_benchmark:
+        performance_scalability.append(
+            "No benchmark module detected. Add macrobenchmark tests for startup and critical screen transitions."
+        )
+    if has_android and not has_baseline_profile:
+        performance_scalability.append(
+            "No baseline profile setup found. Add baseline profiles to improve startup and scrolling performance on real devices."
+        )
+    if has_network_markers and not has_cache_markers:
+        performance_scalability.append(
+            "Network-heavy signals detected without obvious caching markers. Add cache strategy (TTL/invalidation) for high-traffic reads."
+        )
+    if has_db_markers and "index" not in context_lower:
+        performance_scalability.append(
+            "Database usage is visible but index strategy is not. Review hot queries and add index checks to avoid hidden latency spikes."
+        )
+    if not performance_scalability:
+        performance_scalability.append(
+            "Performance baseline looks reasonable from scanned context; keep profiling and benchmark budgets in the CI loop."
+        )
+
+    product_thinking = []
+    if not has_target_user:
+        product_thinking.append(
+            "README does not clearly state target users. Add a 1-2 sentence audience statement near the top."
+        )
+    if not has_differentiator:
+        product_thinking.append(
+            "Differentiator is not explicit. Add a short 'Why this over alternatives' section with concrete tradeoffs."
+        )
+    if not has_roadmap:
+        product_thinking.append(
+            "No roadmap/future features section found. Add near-term milestones and validation criteria."
+        )
+    if not has_demo:
+        product_thinking.append(
+            "Product credibility is limited without demo artifacts. Add screenshots/video for core flows and keep them versioned."
+        )
+    if not product_thinking:
+        product_thinking.append(
+            "Product framing is already clear; next leverage point is adding measurable success metrics per roadmap item."
+        )
+
+    sections = [
+        FounderAuditSection("First impression (10 seconds)", first_impression),
+        FounderAuditSection("Project structure (architecture)", project_structure),
+        FounderAuditSection("Build & run experience", build_run),
+        FounderAuditSection("Code quality signals", code_quality),
+        FounderAuditSection("Security & reliability", security_reliability),
+        FounderAuditSection("Performance & scalability", performance_scalability),
+        FounderAuditSection("Product-level thinking (founder mode)", product_thinking),
+    ]
+
+    return FounderAuditReport(
+        sections=sections,
+        analyzed_files=len(repo_index),
+        index_truncated=truncated,
+    )
+
+
 def build_scoring_config(custom: dict | None = None) -> dict:
     config = {
         "action_base_scores": dict(DEFAULT_ACTION_SCORES),
@@ -224,7 +659,12 @@ def load_scoring_config_file(path: str) -> dict:
     return build_scoring_config(payload)
 
 
-def build_prediction_payload(report: PredictionReport, include_scan: bool, scan: dict) -> dict:
+def build_prediction_payload(
+    report: PredictionReport,
+    include_scan: bool,
+    scan: dict,
+    founder_audit: FounderAuditReport | None = None,
+) -> dict:
     payload = {
         "likely_next_actions": [item.__dict__ for item in report.likely_next_actions],
         "current_intent_inference": report.current_intent_inference,
@@ -234,6 +674,8 @@ def build_prediction_payload(report: PredictionReport, include_scan: bool, scan:
         "reasoning_trace": report.reasoning_trace,
         "alternative_paths": [item.__dict__ for item in report.alternative_paths],
     }
+    if founder_audit is not None:
+        payload["founder_audit"] = founder_audit.to_dict()
     if include_scan:
         payload["scan"] = scan
     return payload
@@ -1234,6 +1676,22 @@ def main() -> None:
         help="Show metadata for ingested and skipped files.",
     )
     parser.add_argument(
+        "--founder-audit",
+        action="store_true",
+        help="Add a 7-part project improvement audit (first impression, architecture, quality, security, performance, product).",
+    )
+    parser.add_argument(
+        "--audit-only",
+        action="store_true",
+        help="Print only the founder audit section (skip prediction markdown output).",
+    )
+    parser.add_argument(
+        "--audit-max-files",
+        type=int,
+        default=5000,
+        help="Max files indexed for founder audit heuristics.",
+    )
+    parser.add_argument(
         "--weights-file",
         type=str,
         default="",
@@ -1294,9 +1752,24 @@ def main() -> None:
         except ValueError as exc:
             raise SystemExit(f"Invalid --weights-file: {exc}") from exc
 
+    founder_audit_report = None
+    if args.founder_audit or args.audit_only:
+        founder_audit_report = build_founder_audit_report(
+            project_dir=str(project_dir),
+            context=context,
+            scan=scan,
+            ignore_dirs=args.ignore_dirs,
+            max_files=max(args.audit_max_files, 1),
+        )
+
     predictor = DigitalTwinPredictor(scoring_config=scoring_config)
     report = predictor.predict(context)
-    payload = build_prediction_payload(report=report, include_scan=args.show_scan, scan=scan)
+    payload = build_prediction_payload(
+        report=report,
+        include_scan=args.show_scan,
+        scan=scan,
+        founder_audit=founder_audit_report,
+    )
 
     if args.json:
         print(
@@ -1306,7 +1779,12 @@ def main() -> None:
             )
         )
     else:
-        print(report.to_markdown())
+        if not args.audit_only:
+            print(report.to_markdown())
+        if founder_audit_report is not None:
+            if not args.audit_only:
+                print()
+            print(founder_audit_report.to_markdown())
         if args.show_scan:
             print()
             print(format_scan_metadata(scan))
